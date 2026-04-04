@@ -1,0 +1,12 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../db:/app/db
+    environment:
+      - DB_PATH=/app/db/mortgage_web.db
+      - FLASK_DEBUG=0
