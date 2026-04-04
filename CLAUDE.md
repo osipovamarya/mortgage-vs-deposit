@@ -16,12 +16,14 @@ The app walks the user through two forms (mortgage → deposit), then shows a si
 
 ```
 mortgage_calc/
-├── app/                          # Original Telegram bot (legacy, do not modify)
+├── tgapp_legacy/                 # Original Telegram bot (legacy, do not modify)
 │   ├── bot.py
 │   ├── mortgage.py               # ← Reused by the web app for calculations
 │   ├── mortgage_registry.py
 │   ├── mortgage_count.py
-│   └── telegram_user.py
+│   ├── telegram_user.py
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── web/                          # New Flask web application (active)
 │   ├── app/
 │   │   ├── __init__.py
@@ -38,16 +40,15 @@ mortgage_calc/
 │   │   │   └── style.css         # Modern clean design
 │   │   └── js/
 │   │       └── app.js            # Step-by-step form logic + result rendering
-│   ├── templates/
-│   │   └── index.html            # Single-page app shell
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── requirements.txt
+│   └── templates/
+│       └── index.html            # Single-page app shell
 ├── db/
 │   ├── morst_bot.db              # Legacy Telegram bot database
 │   └── mortgage_web.db           # Web app database (created on first run)
-├── CLAUDE.md
-└── requirements.txt              # Legacy bot requirements
+├── Dockerfile                    # Web app Docker image (build context: repo root)
+├── docker-compose.yml
+├── requirements.txt              # Web app dependencies (Flask, python-dateutil)
+└── CLAUDE.md
 ```
 
 ---
@@ -57,7 +58,7 @@ mortgage_calc/
 **With Docker (recommended):**
 ```bash
 cd /path/to/mortgage_calc
-docker compose -f web/docker-compose.yml up --build
+docker compose up --build
 ```
 Then open http://localhost:5000
 
@@ -65,11 +66,11 @@ Then open http://localhost:5000
 ```bash
 # Create a virtualenv once
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r web/requirements.txt
+pip install -r requirements.txt
 
 # Run (from repo root)
 cd web
-DB_PATH=../db/mortgage_web.db PYTHONPATH=. flask --app app/main.py run
+DB_PATH=../db/mortgage_web.db PYTHONPATH=.. flask --app app/main.py run
 ```
 
 **Environment variables:**
@@ -89,7 +90,7 @@ DB_PATH=../db/mortgage_web.db PYTHONPATH=. flask --app app/main.py run
 **Database:** SQLite. Single-user, no authentication. All records belong to one local user.
 
 **Calculation logic:**
-- Mortgage annuity payment and schedule: reused from `app/mortgage.py` (root-level)
+- Mortgage annuity payment and schedule: reused from `tgapp_legacy/mortgage.py`
 - Deposit compound interest: implemented in `web/app/calculator.py`
 - Comparison logic: implemented in `web/app/calculator.py`
 
@@ -247,29 +248,29 @@ winner = argmax(deposit_income, reduce_term_interest_saved, reduce_payment_inter
 
 ## Docker
 
-`web/Dockerfile`:
+`Dockerfile` (repo root):
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
-COPY web/requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV DB_PATH=/app/db/mortgage_web.db
 ENV PYTHONPATH=/app
-CMD ["flask", "--app", "web/app/main.py", "run", "--host=0.0.0.0", "--port=5000"]
+CMD ["python", "-m", "flask", "--app", "web/app/main.py", "run", "--host=0.0.0.0", "--port=5000"]
 ```
 
-`web/docker-compose.yml`:
+`docker-compose.yml` (repo root):
 ```yaml
 services:
   web:
     build:
-      context: ..
-      dockerfile: web/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "5000:5000"
     volumes:
-      - ../db:/app/db
+      - ./db:/app/db
     environment:
       - DB_PATH=/app/db/mortgage_web.db
       - FLASK_DEBUG=0
@@ -288,13 +289,13 @@ services:
 
 ---
 
-## Legacy Telegram Bot (app/)
+## Legacy Telegram Bot (tgapp_legacy/)
 
-The original bot is in `app/`. It is **not being modified**. The file `app/mortgage.py` is imported by the web app for its `Mortgage` class and annuity calculation logic. All other `app/` files are legacy.
+The original bot is in `tgapp_legacy/`. It is **not being modified**. The file `tgapp_legacy/mortgage.py` is imported by the web app for its `Mortgage` class and annuity calculation logic. All other `tgapp_legacy/` files are legacy.
 
 Known issues in legacy code (do not fix):
-- `app/mortgage_count.py` line 11: broken import `from mortgage import Mortgage`
-- `app/discussion_vote.py`, `app/estimation_vote.py`: unused leftovers
+- `tgapp_legacy/mortgage_count.py` line 11: broken import `from mortgage import Mortgage`
+- `tgapp_legacy/discussion_vote.py`, `tgapp_legacy/estimation_vote.py`: unused leftovers
 - `run.sh`: hard-coded path for Docker volume
 
 ---
