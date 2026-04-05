@@ -21,7 +21,6 @@ const state = {
 // ── DOM references ─────────────────────────────────────────────
 const sections = {
   mortgage: document.getElementById('section-mortgage'),
-  deposit:  document.getElementById('section-deposit'),
   results:  document.getElementById('section-results'),
 };
 
@@ -104,13 +103,12 @@ function clearError(elementId) {
 function goToStep(n) {
   state.currentStep = n;
 
-  // Show/hide sections
+  // Show/hide sections (2 steps: 1=input, 2=results)
   sections.mortgage.classList.toggle('hidden', n !== 1);
-  sections.deposit.classList.toggle('hidden',  n !== 2);
-  sections.results.classList.toggle('hidden',  n !== 3);
+  sections.results.classList.toggle('hidden',  n !== 2);
 
   // Update step indicators
-  [1, 2, 3].forEach(i => {
+  [1, 2].forEach(i => {
     const dot = document.getElementById(`step-dot-${i}`);
     dot.classList.remove('active', 'done');
     if (i < n)  dot.classList.add('done');
@@ -160,6 +158,12 @@ document.getElementById('form-mortgage').addEventListener('submit', async (e) =>
   btn.disabled = true;
   btn.textContent = 'Считаем…';
 
+  const depositPayload = {
+    annual_rate:    document.getElementById('deposit_rate').value,
+    term_months:    document.getElementById('deposit_term').value,
+    capitalization: document.getElementById('capitalization').checked ? 1 : 0,
+  };
+
   try {
     const result = await postJSON('/api/mortgage', payload);
     state.mortgageId     = result.id;
@@ -167,63 +171,10 @@ document.getElementById('form-mortgage').addEventListener('submit', async (e) =>
     state.mortgageResult = result;
     state.hasLumpSum     = !!(payload.lump_sum && parseFloat(payload.lump_sum) > 0);
     state.mortgageParams = payload;
-    renderMortgageSummary(payload, result);
-    goToStep(2);
-  } catch (err) {
-    showError('mortgage-error', err.message);
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = 'Продолжить <span class="arrow">→</span>';
-  }
-});
+    state.depositParams  = depositPayload;
 
-function renderMortgageSummary(payload, result) {
-  document.getElementById('mortgage-summary').innerHTML = `
-    <div class="s-item">
-      <span class="s-label">Остаток долга</span>
-      <span class="s-value">${rub(payload.loan_amount)}</span>
-    </div>
-    <div class="s-item">
-      <span class="s-label">Ставка</span>
-      <span class="s-value">${payload.annual_rate}% год.</span>
-    </div>
-    <div class="s-item">
-      <span class="s-label">Платёж</span>
-      <span class="s-value">${rub(result.monthly_payment)} / мес.</span>
-    </div>
-    <div class="s-item">
-      <span class="s-label">Кол-во платежей</span>
-      <span class="s-value">${result.payment_count}</span>
-    </div>
-    <div class="s-item">
-      <span class="s-label">Всего процентов</span>
-      <span class="s-value">${rub(result.total_interest)}</span>
-    </div>
-  `;
-}
-
-// ── Step 2: Deposit form ──────────────────────────────────────
-
-document.getElementById('btn-back').addEventListener('click', () => goToStep(1));
-
-document.getElementById('form-deposit').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  clearError('deposit-error');
-
-  const depositPayload = {
-    annual_rate:    document.getElementById('deposit_rate').value,
-    term_months:    document.getElementById('deposit_term').value,
-    capitalization: document.getElementById('capitalization').checked ? 1 : 0,
-  };
-
-  const btn = e.target.querySelector('button[type=submit]');
-  btn.disabled = true;
-  btn.textContent = 'Сравниваем…';
-
-  try {
     const depositResult = await postJSON('/api/deposit', depositPayload);
-    state.depositId     = depositResult.id;
-    state.depositParams = depositPayload;
+    state.depositId = depositResult.id;
 
     const comparison = await postJSON('/api/comparison', {
       strategy_id: state.strategyId,
@@ -231,27 +182,45 @@ document.getElementById('form-deposit').addEventListener('submit', async (e) => 
     });
     state.comparisonData = comparison;
     renderResults(comparison);
-    goToStep(3);
+    goToStep(2);
   } catch (err) {
-    showError('deposit-error', err.message);
+    showError('mortgage-error', err.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Сравнить →';
+    btn.innerHTML = 'Сравнить <span class="arrow">→</span>';
   }
 });
 
+
 // ── Step 3: Results ───────────────────────────────────────────
 
+/** Sum of interest column across a schedule */
+function totalInterest(schedule) {
+  if (!schedule) return 0;
+  return Math.round(schedule.reduce((s, r) => s + (r.interest || 0), 0));
+}
+
 function renderResults(d) {
-  // Recompute winner restricted to the chosen repayment mode
   const mode = d.repayment_mode || 'reduce_payment';
-  const options = {};
-  if (state.hasLumpSum) options.deposit = d.deposit_net_saving;
-  if (mode === 'reduce_payment') options.reduce_payment = d.reduce_payment_interest_saved;
-  if (mode === 'reduce_term')    options.reduce_term    = d.reduce_term_interest_saved;
-  if (d.snowball_interest_saved != null) options.snowball = d.snowball_interest_saved;
-  d.effective_winner = Object.keys(options).length
-    ? Object.entries(options).reduce((a, b) => a[1] >= b[1] ? a : b)[0]
+
+  // Absolute total interest per scenario (lower = better)
+  const baseTotal = totalInterest(d.schedules.baseline);
+  d._totals = {
+    baseline:       baseTotal,
+    deposit:        state.hasLumpSum ? totalInterest(d.schedules.deposit) - Math.round(d.deposit_income) : null,
+    reduce_payment: mode === 'reduce_payment' ? totalInterest(d.schedules.reduce_payment) : null,
+    reduce_term:    mode === 'reduce_term'    ? totalInterest(d.schedules.reduce_payment) : null,
+    snowball:       d.snowball_interest_saved != null ? totalInterest(d.schedules.snowball) : null,
+  };
+
+  // Winner = scenario with minimum effective cost (lower total interest)
+  const candidates = {};
+  if (d._totals.deposit        != null) candidates.deposit        = d._totals.deposit;
+  if (d._totals.reduce_payment != null) candidates.reduce_payment = d._totals.reduce_payment;
+  if (d._totals.reduce_term    != null) candidates.reduce_term    = d._totals.reduce_term;
+  if (d._totals.snowball       != null) candidates.snowball       = d._totals.snowball;
+  d.effective_winner = Object.keys(candidates).length
+    ? Object.entries(candidates).reduce((a, b) => a[1] <= b[1] ? a : b)[0]
     : null;
 
   const hasEarly = (mode === 'reduce_payment' && d.reduce_payment_interest_saved > 0)
@@ -288,6 +257,10 @@ function renderParamsCard(d) {
     <div class="metric metric--compact">
       <div class="metric-label">Конец договора</div>
       <div class="metric-value">${m.last_payment_date}</div>
+    </div>
+    <div class="metric metric--compact">
+      <div class="metric-label">Проценты без изменений</div>
+      <div class="metric-value">${d && d._totals ? rub(d._totals.baseline) : '—'}</div>
     </div>`;
 
   if (state.hasLumpSum) {
@@ -313,19 +286,17 @@ function renderWinnerBanner(d) {
     reduce_term:    'Досрочно → уменьшить срок',
     snowball:       'Снежный ком',
   };
-  const amounts = {
-    deposit:        d.deposit_net_saving,
-    reduce_payment: d.reduce_payment_interest_saved,
-    reduce_term:    d.reduce_term_interest_saved,
-    snowball:       d.snowball_interest_saved,
-  };
   const w = d.effective_winner || d.winner;
+  if (!w) return;
   const cssClass = w === 'deposit' ? 'deposit' : w === 'snowball' ? 'snowball' : w === 'reduce_term' ? 'term' : 'repay';
+  const winTotal   = d._totals[w];
+  const baseTotal  = d._totals.baseline;
+  const saved      = baseTotal - winTotal;
   const banner = document.getElementById('winner-banner');
   banner.className = `winner-banner ${cssClass}`;
   banner.innerHTML = `
-    🏆 ${labels[w]} выгоднее на <strong>${rub(amounts[w])}</strong>
-    <span class="banner-sub">по сравнению с базовым сценарием (ничего не делать)</span>
+    🏆 ${labels[w]} — меньше всего процентов: <strong>${rub(winTotal)}</strong>
+    <span class="banner-sub">на ${rub(saved)} меньше чем ничего не делать</span>
   `;
 }
 
@@ -357,59 +328,61 @@ function renderCards(d) {
 
   // Deposit card (lump_sum scenario)
   if (state.hasLumpSum) {
+    const dep = state.depositParams || {};
+    const capLabel = dep.capitalization ? 'с капитализацией' : 'без капитализации';
+    const depMortgageInterest = totalInterest(d.schedules.deposit);
+    const depSaved = d._totals.baseline - d._totals.deposit;
     const depositPaymentRow = mode === 'reduce_payment'
       ? `<div class="metric">
           <div class="metric-label">Новый платёж после погашения</div>
           <div class="metric-value purple">${rub(d.deposit_new_monthly)} / мес.</div>
         </div>`
       : '';
-    const dep = state.depositParams || {};
-    const capLabel = dep.capitalization ? 'с капитализацией' : 'без капитализации';
     document.getElementById('card-deposit-body').innerHTML = `
       <div class="metric metric--mini">
         <div class="metric-label">Ставка вклада</div>
         <div class="metric-value">${dep.annual_rate}% год. · ${dep.term_months} мес. · ${capLabel}</div>
       </div>
       <div class="metric">
-        <div class="metric-label">Доход за срок вклада</div>
-        <div class="metric-value positive">+${rub(d.deposit_income)}</div>
+        <div class="metric-label">Проценты по ипотеке</div>
+        <div class="metric-value">${rub(depMortgageInterest)}</div>
       </div>
       <div class="metric">
-        <div class="metric-label">Итого для погашения через ${d.deposit_term_months} мес.</div>
-        <div class="metric-value accent">${rub(d.deposit_final)}</div>
+        <div class="metric-label">Доход по вкладу</div>
+        <div class="metric-value positive">−${rub(Math.round(d.deposit_income))}</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Итого выплат</div>
+        <div class="metric-value accent">${rub(d._totals.deposit)}</div>
       </div>
       ${depositPaymentRow}
-      <div class="metric">
-        <div class="metric-label">Итоговая экономия на процентах</div>
-        <div class="metric-value positive">+${rub(d.deposit_net_saving)}</div>
-      </div>
+      <div class="metric--vs">на ${rub(depSaved)} меньше чем ничего не делать</div>
     `;
   }
 
   // Reduce payment card
+  const rpTotal = d._totals.reduce_payment;
+  const rpSaved = d._totals.baseline - rpTotal;
   document.getElementById('card-reduce-payment-body').innerHTML = `
     <div class="metric">
-      <div class="metric-label">Сэкономлено на процентах</div>
-      <div class="metric-value positive">+${rub(d.reduce_payment_interest_saved)}</div>
+      <div class="metric-label">Проценты по ипотеке</div>
+      <div class="metric-value">${rub(rpTotal)}</div>
     </div>
     <div class="metric">
       <div class="metric-label">Новый платёж</div>
       <div class="metric-value purple">${rub(d.reduce_payment_new_monthly)} / мес.</div>
     </div>
-    <div class="metric">
-      <div class="metric-label">Снижение платежа</div>
-      <div class="metric-value" style="font-size:.95rem">
-        −${rub(d.monthly_payment - d.reduce_payment_new_monthly)} / мес.
-      </div>
-    </div>
+    <div class="metric--vs">на ${rub(rpSaved)} меньше чем ничего не делать</div>
   `;
 
   // Reduce term card
   const rtEndDate = scheduleEndDate(d.schedules.reduce_payment);
+  const rtTotal = d._totals.reduce_term;
+  const rtSaved = d._totals.baseline - rtTotal;
   document.getElementById('card-reduce-term-body').innerHTML = `
     <div class="metric">
-      <div class="metric-label">Сэкономлено на процентах</div>
-      <div class="metric-value positive">+${rub(d.reduce_term_interest_saved)}</div>
+      <div class="metric-label">Проценты по ипотеке</div>
+      <div class="metric-value">${rub(rtTotal)}</div>
     </div>
     <div class="metric">
       <div class="metric-label">Ипотека закроется</div>
@@ -419,6 +392,7 @@ function renderCards(d) {
       <div class="metric-label">Срок сокращается на</div>
       <div class="metric-value accent">${fmtMonths(d.reduce_term_months_saved)}</div>
     </div>
+    <div class="metric--vs">на ${rub(rtSaved)} меньше чем ничего не делать</div>
   `;
 
   // Snowball card — shown only when monthly_budget was provided
@@ -436,14 +410,16 @@ function renderCards(d) {
     let snowParamsLine = `бюджет ${rub(mp.monthly_budget)}/мес.`;
     if (mp.monthly_start_date) snowParamsLine += ` · с ${mp.monthly_start_date}`;
     if (mp.monthly_extra_day)  snowParamsLine += ` · досрочка ${mp.monthly_extra_day}-го числа`;
+    const swTotal = d._totals.snowball;
+    const swSaved = d._totals.baseline - swTotal;
     document.getElementById('card-snowball-body').innerHTML = `
       <div class="metric metric--mini">
         <div class="metric-label">Параметры</div>
         <div class="metric-value">${snowParamsLine}</div>
       </div>
       <div class="metric">
-        <div class="metric-label">Сэкономлено на процентах</div>
-        <div class="metric-value positive">+${rub(d.snowball_interest_saved)}</div>
+        <div class="metric-label">Проценты по ипотеке</div>
+        <div class="metric-value">${rub(swTotal)}</div>
       </div>
       <div class="metric">
         <div class="metric-label">Ипотека закроется</div>
@@ -453,6 +429,7 @@ function renderCards(d) {
         <div class="metric-label">Срок сокращается на</div>
         <div class="metric-value accent">${fmtMonths(savedMonths)}</div>
       </div>
+      <div class="metric--vs">на ${rub(swSaved)} меньше чем ничего не делать</div>
     `;
 
     // Snowball deposit alternative card
@@ -801,9 +778,5 @@ document.getElementById('btn-recalc').addEventListener('click', () => {
   });
   document.getElementById('schedule-table-wrap').classList.remove('hidden');
   document.getElementById('btn-toggle-table').textContent = 'Скрыть таблицу ↑';
-  // Clear strategy fields so stale values don't carry over
-  ['lump_sum', 'lump_sum_date', 'monthly_budget', 'monthly_start_date', 'monthly_extra_day'].forEach(id => {
-    document.getElementById(id).value = '';
-  });
   goToStep(1);
 });

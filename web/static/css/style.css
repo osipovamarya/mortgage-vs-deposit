@@ -374,6 +374,13 @@ input.invalid { border-color: #EF4444; }
 .metric--compact .metric-value { font-size: .95rem; font-weight: 600; }
 .metric--mini { margin-bottom: .6rem; padding-bottom: .6rem; border-bottom: 1px solid var(--gray-100); }
 .metric--mini .metric-value { font-size: .8rem; font-weight: 500; color: var(--gray-500); }
+.metric--vs {
+  font-size: .78rem;
+  color: var(--gray-400);
+  margin-top: .5rem;
+  padding-top: .5rem;
+  border-top: 1px solid var(--gray-100);
+}
 .params-section-label {
   font-size: .7rem;
   font-weight: 700;

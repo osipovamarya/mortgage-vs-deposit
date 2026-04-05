@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ипотека или вклад?</title>
+  <link rel="icon" href="/static/favicon.ico" sizes="any">
   <link rel="stylesheet" href="/static/css/style.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
@@ -22,21 +23,16 @@
   <div class="steps" id="steps">
     <div class="step active" id="step-dot-1">
       <div class="step-circle">1</div>
-      <div class="step-label">Ипотека</div>
+      <div class="step-label">Параметры</div>
     </div>
     <div class="step-line"></div>
     <div class="step" id="step-dot-2">
       <div class="step-circle">2</div>
-      <div class="step-label">Накопления</div>
-    </div>
-    <div class="step-line"></div>
-    <div class="step" id="step-dot-3">
-      <div class="step-circle">3</div>
       <div class="step-label">Результат</div>
     </div>
   </div>
 
-  <!-- ===== Step 1: Mortgage ===== -->
+  <!-- ===== Step 1: All inputs ===== -->
   <section class="card" id="section-mortgage">
     <h2>Ваша ипотека</h2>
     <p class="subtitle">Введите текущие параметры — остаток долга на сегодня.</p>
@@ -139,54 +135,41 @@
         </div>
       </div>
 
+      <div class="strategy-section">
+        <h3>Параметры вклада</h3>
+        <p class="subtitle">Условия вклада для сравнения со стратегией досрочного погашения.</p>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="deposit_rate">Ставка вклада (% годовых)</label>
+            <input type="number" id="deposit_rate" name="deposit_rate"
+                   placeholder="16" value="16" step="0.01" min="0.1" required>
+          </div>
+          <div class="form-group">
+            <label for="deposit_term">Срок вклада (месяцев)</label>
+            <input type="number" id="deposit_term" name="deposit_term"
+                   placeholder="12" value="12" min="1" max="360" required>
+          </div>
+        </div>
+
+        <div class="form-group form-group--center">
+          <label class="checkbox-label">
+            <input type="checkbox" id="capitalization" name="capitalization" checked>
+            <span>Капитализация процентов</span>
+          </label>
+          <small>Ежемесячное начисление процентов на проценты</small>
+        </div>
+      </div>
+
       <div id="mortgage-error" class="error-msg hidden"></div>
 
       <button type="submit" class="btn-primary">
-        Продолжить <span class="arrow">→</span>
+        Сравнить <span class="arrow">→</span>
       </button>
     </form>
   </section>
 
-  <!-- ===== Step 2: Deposit ===== -->
-  <section class="card hidden" id="section-deposit">
-    <h2>Ваши накопления</h2>
-    <p class="subtitle">Сумма, которую вы хотите либо положить на вклад, либо направить на погашение ипотеки.</p>
-
-    <!-- Mortgage summary (filled after step 1) -->
-    <div class="summary-block" id="mortgage-summary"></div>
-
-    <form id="form-deposit" novalidate>
-      <div class="form-row">
-        <div class="form-group">
-          <label for="deposit_rate">Ставка вклада (% годовых)</label>
-          <input type="number" id="deposit_rate" name="deposit_rate"
-                 placeholder="16" value="16" step="0.01" min="0.1" required>
-        </div>
-        <div class="form-group">
-          <label for="deposit_term">Срок вклада (месяцев)</label>
-          <input type="number" id="deposit_term" name="deposit_term"
-                 placeholder="12" value="12" min="1" max="360" required>
-        </div>
-      </div>
-
-      <div class="form-group form-group--center">
-        <label class="checkbox-label">
-          <input type="checkbox" id="capitalization" name="capitalization" checked>
-          <span>Капитализация процентов</span>
-        </label>
-        <small>Ежемесячное начисление процентов на проценты</small>
-      </div>
-
-      <div id="deposit-error" class="error-msg hidden"></div>
-
-      <div class="btn-row">
-        <button type="button" class="btn-secondary" id="btn-back">← Назад</button>
-        <button type="submit" class="btn-primary">Сравнить →</button>
-      </div>
-    </form>
-  </section>
-
-  <!-- ===== Step 3: Results ===== -->
+  <!-- ===== Step 2: Results ===== -->
   <section class="hidden" id="section-results">
 
     <!-- Winner banner -->

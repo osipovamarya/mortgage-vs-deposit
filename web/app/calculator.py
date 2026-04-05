@@ -550,13 +550,19 @@ def run_comparison(mortgage, deposit, strategy=None):
     snowball_fields = {}
 
     if monthly_budget:
+        # When lump_sum has no explicit date but a deposit term is set, delay the lump
+        # in the snowball until the deposit matures (monthly extras still run from month 1).
+        if lump_sum > 0 and not lump_sum_date and deposit:
+            snowball_lump_idx = min(deposit['term_months'], original_n - 1)
+        else:
+            snowball_lump_idx = lump_idx
         snow_interest, snow_months, snow_schedule = calc_repayment_schedule(
             mortgage['loan_amount'],
             mortgage['annual_rate'],
             mortgage['first_payment_date'],
             mortgage['last_payment_date'],
             lump_sum,
-            lump_idx,
+            snowball_lump_idx,
             monthly_budget,
             monthly_idx,
             monthly_extra_day=monthly_extra_day,
