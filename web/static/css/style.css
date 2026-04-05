@@ -352,6 +352,7 @@ input.invalid { border-color: #EF4444; }
 }
 
 .table-scroll { overflow-x: auto; margin-top: 1rem; }
+.fact-payment { color: var(--gray-500); font-size: .8rem; white-space: nowrap; }
 table { width: 100%; border-collapse: collapse; font-size: .875rem; }
 thead tr { background: var(--gray-100); }
 th {

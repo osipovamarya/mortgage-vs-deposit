@@ -1,4 +1,5 @@
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from flask import Blueprint, request, jsonify
 from ..database import get_db
 from ..calculator import run_comparison, build_amortization
@@ -28,20 +29,22 @@ def create_comparison():
 
     result = run_comparison(mortgage, deposit)
 
+    # Extract base_schedule before storing/returning result (not stored in DB)
+    base_schedule = result.pop('base_schedule')
+    balance_after_deposit = result.pop('balance_after_deposit')
+
     cursor = db.execute(
         """INSERT INTO comparison (
             mortgage_id, deposit_id,
             deposit_income, deposit_final,
-            reduce_term_new_last_date, reduce_term_months_saved, reduce_term_interest_saved,
+            deposit_net_saving,
             reduce_payment_new_monthly, reduce_payment_interest_saved,
             baseline_total_interest, winner
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             data['mortgage_id'], data['deposit_id'],
             result['deposit_income'], result['deposit_final'],
-            result['reduce_term_new_last_date'],
-            result['reduce_term_months_saved'],
-            result['reduce_term_interest_saved'],
+            result['deposit_net_saving'],
             result['reduce_payment_new_monthly'],
             result['reduce_payment_interest_saved'],
             result['baseline_total_interest'],
@@ -50,32 +53,60 @@ def create_comparison():
     )
     db.commit()
 
-    # Build full schedules to send to the frontend (not stored in DB — can be recalculated)
+    # Build full schedules to send to the frontend (not stored in DB)
     first_dt = datetime.fromisoformat(mortgage['first_payment_date'])
     last_dt = datetime.fromisoformat(mortgage['last_payment_date'])
-    new_loan = mortgage['loan_amount'] - deposit['amount']
-    new_last_b1 = datetime.fromisoformat(result['reduce_term_new_last_date'])
+    next_dt = first_dt + relativedelta(months=1)
+    adj = bool(mortgage.get('adjust_business_days'))
+    new_loan = max(mortgage['loan_amount'] - deposit['amount'], 0)
 
-    base_schedule, _, _ = build_amortization(
-        mortgage['loan_amount'], mortgage['annual_rate'],
-        first_dt, last_dt, mortgage['monthly_payment']
-    )
-    rt_schedule, _, _ = build_amortization(
-        new_loan, mortgage['annual_rate'],
-        first_dt, new_last_b1, mortgage['monthly_payment']
-    )
     rp_schedule, _, _ = build_amortization(
         new_loan, mortgage['annual_rate'],
-        first_dt, last_dt, result['reduce_payment_new_monthly']
+        next_dt, last_dt,
+        adjust_business_days=adj,
+        prev_payment_date=first_dt,
     )
+
+    # Deposit schedule: N months normal + remaining months after lump-sum repayment.
+    # base_schedule[0] = May; base_schedule[term_months-1] = first_dt + term_months.
+    # Next payment after deposit matures = first_dt + term_months + 1.
+    term_months = result['deposit_term_months']
+    deposit_schedule_part1 = base_schedule[:term_months]
+    new_loan_A = max(balance_after_deposit - result['deposit_final'], 0)
+    if new_loan_A > 0.01:
+        repayment_dt = first_dt + relativedelta(months=term_months + 1)
+        deposit_part2, _, _ = build_amortization(
+            new_loan_A, mortgage['annual_rate'], repayment_dt, last_dt,
+            adjust_business_days=adj,
+        )
+        offset = len(deposit_schedule_part1)
+        for row in deposit_part2:
+            row['payment_num'] += offset
+        deposit_schedule = deposit_schedule_part1 + deposit_part2
+    else:
+        deposit_schedule = deposit_schedule_part1
+
+    # Prepend a static row for the last-made payment (April) so row 1 always
+    # shows the entered balance without any recalculation.
+    static_row = {
+        'payment_num': 1,
+        'date': first_dt.strftime('%d.%m.%Y'),
+        'payment': mortgage['monthly_payment'],
+        'principal': 0.0,
+        'interest': 0.0,
+        'balance': mortgage['loan_amount'],
+    }
+
+    def with_static(sched):
+        return [static_row] + [dict(r, payment_num=r['payment_num'] + 1) for r in sched]
 
     return jsonify({
         'id': cursor.lastrowid,
         **result,
         'schedules': {
-            'baseline': base_schedule,
-            'reduce_term': rt_schedule,
-            'reduce_payment': rp_schedule,
+            'baseline': with_static(base_schedule),
+            'deposit': with_static(deposit_schedule),
+            'reduce_payment': with_static(rp_schedule),
         },
     })
 

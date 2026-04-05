@@ -104,11 +104,12 @@ document.getElementById('form-mortgage').addEventListener('submit', async (e) =>
   clearError('mortgage-error');
 
   const payload = {
-    loan_amount:        document.getElementById('loan_amount').value,
-    annual_rate:        document.getElementById('annual_rate').value,
-    monthly_payment:    document.getElementById('monthly_payment').value || null,
-    first_payment_date: document.getElementById('first_payment_date').value,
-    last_payment_date:  document.getElementById('last_payment_date').value,
+    loan_amount:           document.getElementById('loan_amount').value,
+    annual_rate:           document.getElementById('annual_rate').value,
+    monthly_payment:       document.getElementById('monthly_payment').value || null,
+    first_payment_date:    document.getElementById('first_payment_date').value,
+    last_payment_date:     document.getElementById('last_payment_date').value,
+    adjust_business_days:  document.getElementById('adjust_business_days').checked ? 1 : 0,
   };
 
   const btn = e.target.querySelector('button[type=submit]');
@@ -205,13 +206,11 @@ function renderResults(d) {
 
 function renderWinnerBanner(d) {
   const labels = {
-    deposit:        'Вклад',
-    reduce_term:    'Досрочное погашение (сократить срок)',
-    reduce_payment: 'Досрочное погашение (уменьшить платёж)',
+    deposit:        'Вклад → затем погасить',
+    reduce_payment: 'Досрочное погашение',
   };
   const amounts = {
-    deposit:        d.deposit_income,
-    reduce_term:    d.reduce_term_interest_saved,
+    deposit:        d.deposit_net_saving,
     reduce_payment: d.reduce_payment_interest_saved,
   };
   const isRepay = d.winner !== 'deposit';
@@ -231,34 +230,16 @@ function renderCards(d) {
       <div class="metric-value positive">+${rub(d.deposit_income)}</div>
     </div>
     <div class="metric">
-      <div class="metric-label">Итоговая сумма</div>
+      <div class="metric-label">Итого для погашения через ${d.deposit_term_months} мес.</div>
       <div class="metric-value accent">${rub(d.deposit_final)}</div>
     </div>
     <div class="metric">
-      <div class="metric-label">Ипотека не изменяется</div>
-      <div class="metric-value" style="font-size:.95rem">Продолжаете платить как обычно</div>
-    </div>
-  `;
-
-  // Reduce term card
-  const newDateFmt = new Date(d.reduce_term_new_last_date)
-    .toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
-  document.getElementById('card-reduce-term-body').innerHTML = `
-    <div class="metric">
-      <div class="metric-label">Сэкономлено на процентах</div>
-      <div class="metric-value positive">+${rub(d.reduce_term_interest_saved)}</div>
+      <div class="metric-label">Новый платёж после погашения</div>
+      <div class="metric-value purple">${rub(d.deposit_new_monthly)} / мес.</div>
     </div>
     <div class="metric">
-      <div class="metric-label">Срок сократится на</div>
-      <div class="metric-value accent">${fmtMonths(d.reduce_term_months_saved)}</div>
-    </div>
-    <div class="metric">
-      <div class="metric-label">Новая дата закрытия</div>
-      <div class="metric-value" style="font-size:.95rem">${newDateFmt}</div>
-    </div>
-    <div class="metric">
-      <div class="metric-label">Платёж остаётся</div>
-      <div class="metric-value" style="font-size:.95rem">${rub(d.monthly_payment)} / мес.</div>
+      <div class="metric-label">Итоговая экономия на процентах</div>
+      <div class="metric-value positive">+${rub(d.deposit_net_saving)}</div>
     </div>
   `;
 
@@ -287,7 +268,6 @@ function renderCards(d) {
   // Mark winner
   const cardMap = {
     deposit:        'card-deposit',
-    reduce_term:    'card-reduce-term',
     reduce_payment: 'card-reduce-payment',
   };
   document.getElementById(cardMap[d.winner]).classList.add('is-winner');
@@ -315,7 +295,7 @@ function renderChartBalance(schedules) {
   if (state.chartBalance) state.chartBalance.destroy();
 
   const base = buildBalanceSeries(schedules.baseline);
-  const rt   = buildBalanceSeries(schedules.reduce_term);
+  const dep  = buildBalanceSeries(schedules.deposit);
   const rp   = buildBalanceSeries(schedules.reduce_payment);
 
   const ctx = document.getElementById('balance-chart').getContext('2d');
@@ -334,16 +314,16 @@ function renderChartBalance(schedules) {
           fill: false,
         },
         {
-          label: 'Сократить срок',
-          data: rt.balance,
-          borderColor: '#16A34A',
-          backgroundColor: 'rgba(22,163,74,.08)',
+          label: 'Вклад → погасить',
+          data: dep.balance,
+          borderColor: '#2563EB',
+          backgroundColor: 'rgba(37,99,235,.08)',
           borderWidth: 2.5,
           pointRadius: 0,
           fill: false,
         },
         {
-          label: 'Уменьшить платёж',
+          label: 'Досрочно погасить',
           data: rp.balance,
           borderColor: '#7C3AED',
           backgroundColor: 'rgba(124,58,237,.08)',
@@ -383,17 +363,15 @@ function renderChartGain(d) {
   state.chartGain = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: ['Вклад', 'Досрочно → срок', 'Досрочно → платёж'],
+      labels: ['Вклад → погасить', 'Досрочно погасить'],
       datasets: [{
-        label: 'Выгода (₽)',
+        label: 'Экономия на процентах (₽)',
         data: [
-          d.deposit_income,
-          d.reduce_term_interest_saved,
+          d.deposit_net_saving,
           d.reduce_payment_interest_saved,
         ],
         backgroundColor: [
           'rgba(37,99,235,.75)',
-          'rgba(22,163,74,.75)',
           'rgba(124,58,237,.75)',
         ],
         borderRadius: 6,
@@ -427,17 +405,23 @@ function renderChartGain(d) {
 
 function renderScheduleTable(tab, schedules) {
   const rows  = schedules[tab] || [];
+  const entered = state.comparisonData && state.comparisonData.entered_monthly_payment;
   const tbody = document.getElementById('schedule-tbody');
-  tbody.innerHTML = rows.map(r => `
+  tbody.innerHTML = rows.map((r, i) => {
+    const isFirst = i === 0 && entered && Math.abs(entered - r.payment) > 0.05;
+    const paymentCell = isFirst
+      ? `${rub(r.payment)} <small class="fact-payment">(факт: ${rub(entered)})</small>`
+      : rub(r.payment);
+    return `
     <tr>
       <td>${r.payment_num}</td>
       <td>${r.date}</td>
-      <td>${rub(r.payment)}</td>
+      <td>${paymentCell}</td>
       <td>${rub(r.principal)}</td>
       <td>${rub(r.interest)}</td>
       <td>${rub(r.balance)}</td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }).join('');
 }
 
 function initTableTabs(schedules) {
@@ -466,14 +450,14 @@ document.getElementById('btn-recalc').addEventListener('click', () => {
   state.mortgageResult = null;
   state.comparisonData = null;
   // Reset winner marks
-  ['card-deposit','card-reduce-term','card-reduce-payment'].forEach(id => {
+  ['card-deposit','card-reduce-payment'].forEach(id => {
     document.getElementById(id).classList.remove('is-winner');
   });
   // Reset tabs
   document.querySelectorAll('.tab-btn').forEach((b, i) => {
     b.classList.toggle('active', i === 0);
   });
-  document.getElementById('schedule-table-wrap').classList.add('hidden');
-  document.getElementById('btn-toggle-table').textContent = 'Показать таблицу ↓';
+  document.getElementById('schedule-table-wrap').classList.remove('hidden');
+  document.getElementById('btn-toggle-table').textContent = 'Скрыть таблицу ↑';
   goToStep(1);
 });

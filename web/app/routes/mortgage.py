@@ -1,4 +1,5 @@
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from flask import Blueprint, request, jsonify
 from ..database import get_db
 from ..calculator import build_amortization
@@ -10,7 +11,7 @@ mortgage_bp = Blueprint('mortgage', __name__, url_prefix='/api/mortgage')
 def create_mortgage():
     data = request.get_json()
 
-    for field in ('loan_amount', 'annual_rate', 'first_payment_date', 'last_payment_date'):
+    for field in ('loan_amount', 'annual_rate', 'first_payment_date', 'last_payment_date', 'monthly_payment'):
         if not data.get(field):
             return jsonify({'error': f'Поле обязательно: {field}'}), 400
 
@@ -25,16 +26,21 @@ def create_mortgage():
 
     loan_amount = float(data['loan_amount'])
     annual_rate = float(data['annual_rate'])
-    monthly_payment = float(data['monthly_payment']) if data.get('monthly_payment') else None
+    monthly_payment = float(data['monthly_payment'])
+    adjust_business_days = 1 if data.get('adjust_business_days') else 0
 
-    schedule, monthly_payment, total_interest = build_amortization(
-        loan_amount, annual_rate, first_dt, last_dt, monthly_payment
+    next_dt = first_dt + relativedelta(months=1)
+    schedule, _, total_interest = build_amortization(
+        loan_amount, annual_rate, next_dt, last_dt,
+        adjust_business_days=bool(adjust_business_days),
+        prev_payment_date=first_dt,
+        fixed_payment=monthly_payment,
     )
 
     db = get_db()
     cursor = db.execute(
-        """INSERT INTO mortgage (name, loan_amount, annual_rate, first_payment_date, last_payment_date, monthly_payment)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO mortgage (name, loan_amount, annual_rate, first_payment_date, last_payment_date, monthly_payment, adjust_business_days)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (
             data.get('name', 'Моя ипотека'),
             loan_amount,
@@ -42,6 +48,7 @@ def create_mortgage():
             first_dt.strftime('%Y-%m-%d'),
             last_dt.strftime('%Y-%m-%d'),
             monthly_payment,
+            adjust_business_days,
         ),
     )
     db.commit()

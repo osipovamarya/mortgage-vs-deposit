@@ -45,7 +45,7 @@
       <div class="form-group">
         <label for="loan_amount">Остаток долга (₽)</label>
         <input type="number" id="loan_amount" name="loan_amount"
-               placeholder="2 996 530.17" value="2996530.17" step="0.01" required>
+               placeholder="2 996 530.17" value="2995218.84" step="0.01" required>
       </div>
 
       <div class="form-row">
@@ -55,28 +55,34 @@
                  placeholder="7.99" value="7.99" step="0.01" min="0.1" max="100" required>
         </div>
         <div class="form-group">
-          <label for="monthly_payment">
-            Ежемесячный платёж (₽)
-            <span class="hint">необязательно</span>
-          </label>
+          <label for="monthly_payment">Сумма последнего платежа (₽)</label>
           <input type="number" id="monthly_payment" name="monthly_payment"
-                 placeholder="рассчитать автоматически" value="23124.77" step="0.01" min="0">
-          <small>Если не указать — рассчитается из параметров</small>
+                 placeholder="23124.77" value="23124.77" step="0.01" min="0" required>
+          <small>Последний списанный банком платеж</small>
         </div>
       </div>
 
       <div class="form-row">
         <div class="form-group">
-          <label for="first_payment_date">Дата следующего платежа</label>
+          <label for="first_payment_date">Дата последнего платежа</label>
           <input type="text" id="first_payment_date" name="first_payment_date"
-                 placeholder="ДД.ММ.ГГГГ" value="02.05.2026" required>
-          <small>Ближайший предстоящий платёж</small>
+                 placeholder="ДД.ММ.ГГГГ" value="02.04.2026" required>
+          <small>Последний совершённый платёж (текущий месяц)</small>
         </div>
         <div class="form-group">
-          <label for="last_payment_date">Дата последнего платежа</label>
+          <label for="last_payment_date">Дата конца договора</label>
           <input type="text" id="last_payment_date" name="last_payment_date"
                  placeholder="ДД.ММ.ГГГГ" value="02.03.2051" required>
+          <small>Последний платёж по договору</small>
         </div>
+      </div>
+
+      <div class="form-group form-group--center">
+        <label class="checkbox-label">
+          <input type="checkbox" id="adjust_business_days" name="adjust_business_days" checked>
+          <span>Переносить платёж на следующий рабочий день</span>
+        </label>
+        <small>Если дата выпадает на выходной — сдвигать на понедельник, проценты пересчитываются по фактическим дням</small>
       </div>
 
       <div id="mortgage-error" class="error-msg hidden"></div>
@@ -144,14 +150,8 @@
 
       <div class="result-card result-card--deposit" id="card-deposit">
         <div class="result-card__icon">💰</div>
-        <h3>Положить на вклад</h3>
+        <h3>Вклад → потом погасить</h3>
         <div class="result-card__body" id="card-deposit-body"></div>
-      </div>
-
-      <div class="result-card result-card--term" id="card-reduce-term">
-        <div class="result-card__icon">⏱</div>
-        <h3>Досрочно погасить<br><span class="sub">→ сократить срок</span></h3>
-        <div class="result-card__body" id="card-reduce-term-body"></div>
       </div>
 
       <div class="result-card result-card--payment" id="card-reduce-payment">
@@ -172,7 +172,7 @@
     <!-- Comparison bar chart -->
     <div class="card chart-card">
       <h3>Выгода по сценариям (₽)</h3>
-      <p class="subtitle">Доход от вклада или сэкономленные проценты по ипотеке</p>
+      <p class="subtitle">Экономия на процентах по ипотеке для каждого сценария</p>
       <canvas id="gain-chart"></canvas>
     </div>
 
@@ -182,13 +182,13 @@
         <h3>График платежей</h3>
         <div class="tab-buttons">
           <button class="tab-btn active" data-tab="baseline">Без изменений</button>
-          <button class="tab-btn" data-tab="reduce_term">Сократить срок</button>
-          <button class="tab-btn" data-tab="reduce_payment">Уменьшить платёж</button>
+          <button class="tab-btn" data-tab="deposit">Вклад → погасить</button>
+          <button class="tab-btn" data-tab="reduce_payment">Досрочно погасить</button>
         </div>
-        <button class="btn-toggle" id="btn-toggle-table">Показать таблицу ↓</button>
+        <button class="btn-toggle" id="btn-toggle-table">Скрыть таблицу ↑</button>
       </div>
 
-      <div id="schedule-table-wrap" class="hidden">
+      <div id="schedule-table-wrap">
         <div class="table-scroll">
           <table id="schedule-table">
             <thead>

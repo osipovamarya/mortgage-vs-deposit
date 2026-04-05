@@ -2,6 +2,13 @@ import os
 import sqlite3
 from flask import g, current_app
 
+_MIGRATIONS = [
+    "ALTER TABLE comparison ADD COLUMN deposit_net_saving REAL",
+    "ALTER TABLE comparison ADD COLUMN deposit_months_saved INTEGER",
+    "ALTER TABLE comparison ADD COLUMN deposit_new_last_date TEXT",
+    "ALTER TABLE mortgage ADD COLUMN adjust_business_days INTEGER DEFAULT 0",
+]
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mortgage (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,6 +38,9 @@ CREATE TABLE IF NOT EXISTS comparison (
     deposit_id                    INTEGER NOT NULL,
     deposit_income                REAL,
     deposit_final                 REAL,
+    deposit_net_saving            REAL,
+    deposit_months_saved          INTEGER,
+    deposit_new_last_date         TEXT,
     reduce_term_new_last_date     TEXT,
     reduce_term_months_saved      INTEGER,
     reduce_term_interest_saved    REAL,
@@ -46,12 +56,18 @@ CREATE TABLE IF NOT EXISTS comparison (
 
 
 def init_db(db_path):
-    """Create tables if they don't exist. Called once at app startup."""
+    """Create tables if they don't exist and apply schema migrations."""
     db_dir = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+    for sql in _MIGRATIONS:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.close()
 
 

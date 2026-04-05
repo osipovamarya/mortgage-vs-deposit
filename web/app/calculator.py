@@ -4,22 +4,51 @@ Core financial calculation logic.
 All mortgage calculations use the annuity (равные платежи) method.
 Deposit calculations support both compound (капитализация) and simple interest.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from dateutil.rrule import rrule, MONTHLY
 from dateutil.relativedelta import relativedelta
+
+_CENT = Decimal('0.01')
+
+def _d(x):
+    return Decimal(str(x))
+
+def _r2(x):
+    return x.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _next_business_day(date):
+    """Move Saturday → Monday, Sunday → Monday. No holiday calendar."""
+    wd = date.weekday()
+    if wd == 5:
+        return date + timedelta(days=2)
+    if wd == 6:
+        return date + timedelta(days=1)
+    return date
 
 
 # ---------------------------------------------------------------------------
 # Mortgage amortization
 # ---------------------------------------------------------------------------
 
-def build_amortization(loan_amount, annual_rate, first_payment_date, last_payment_date, monthly_payment=None):
+def build_amortization(loan_amount, annual_rate, first_payment_date, last_payment_date,
+                       adjust_business_days=False, prev_payment_date=None, fixed_payment=None):
     """
-    Generate a full month-by-month amortization schedule.
+    Generate a full month-by-month amortization schedule starting from
+    first_payment_date, with loan_amount as the opening balance.
+
+    Payment per period is recalculated each month using the actual number of
+    remaining days to last_payment_date, matching the bank formula:
+        payment = PMT(rate/12, ROUND(days_left/365*12, 0), balance)
 
     Returns:
         schedule        — list of dicts, one per payment
-        monthly_payment — the fixed monthly payment amount
+        first_payment   — payment amount of the first period
         total_interest  — sum of all interest portions
     """
     if isinstance(first_payment_date, str):
@@ -27,61 +56,67 @@ def build_amortization(loan_amount, annual_rate, first_payment_date, last_paymen
     if isinstance(last_payment_date, str):
         last_payment_date = datetime.fromisoformat(last_payment_date)
 
-    monthly_rate = annual_rate / 100 / 12
-    dates = list(rrule(MONTHLY, dtstart=first_payment_date, until=last_payment_date))
-    n = len(dates)
+    annual_rate_d = _d(annual_rate)
+    rate = annual_rate_d / _d(100) / _d(12)
 
-    if not monthly_payment:
-        # Annuity formula: M = P * r / (1 - (1+r)^-n)
-        monthly_payment = loan_amount * (monthly_rate / (1 - (1 + monthly_rate) ** -n))
-        monthly_payment = round(monthly_payment, 2)
+    scheduled = list(rrule(MONTHLY, dtstart=first_payment_date, until=last_payment_date))
+    n = len(scheduled)
+
+    if adjust_business_days:
+        dates = [_next_business_day(d) for d in scheduled]
+        # Previous payment date for day-count of the first period:
+        # use explicitly supplied date, or fall back to one month before start.
+        _prev = prev_payment_date if prev_payment_date is not None else (first_payment_date - relativedelta(months=1))
+        prev_date = _next_business_day(_prev)
+    else:
+        dates = scheduled
+        prev_date = None  # unused
 
     schedule = []
-    balance = loan_amount
-    total_interest = 0.0
+    balance = _d(loan_amount)
+    total_interest = Decimal('0')
+    first_payment = None
 
     for i, date in enumerate(dates):
-        interest = round(balance * monthly_rate, 2)
+        if adjust_business_days:
+            days = (date - prev_date).days
+            interest = _r2(balance * annual_rate_d / _d(100) / _d(365) * _d(days))
+            prev_date = date
+        else:
+            interest = _r2(balance * rate)
 
         if i == n - 1:
-            # Last payment clears any remaining balance
-            principal = round(balance, 2)
-            payment = round(principal + interest, 2)
+            # Last scheduled date: clear whatever remains
+            principal = _r2(balance)
+            payment = _r2(principal + interest)
+        elif fixed_payment is not None:
+            # Known fixed payment — derive principal from it
+            payment = _d(fixed_payment)
+            principal = _r2(payment - interest)
         else:
-            principal = round(monthly_payment - interest, 2)
-            payment = monthly_payment
+            # Dynamic: PMT(rate, remaining_n, balance) — recalculate each month
+            days_left = (last_payment_date - date).days
+            remaining_n = max(round(days_left / 365 * 12), 1)
+            factor = (1 + rate) ** remaining_n
+            payment = _r2(balance * rate * factor / (factor - 1))
+            principal = _r2(payment - interest)
 
-        balance = round(max(balance - principal, 0), 2)
+        balance = balance - principal  # exact Decimal subtraction, no rounding
         total_interest += interest
+
+        if first_payment is None:
+            first_payment = payment
 
         schedule.append({
             'payment_num': i + 1,
             'date': date.strftime('%d.%m.%Y'),
-            'payment': payment,
-            'principal': principal,
-            'interest': interest,
-            'balance': balance,
+            'payment': float(payment),
+            'principal': float(principal),
+            'interest': float(interest),
+            'balance': float(_r2(balance)),
         })
 
-    return schedule, monthly_payment, round(total_interest, 2)
-
-
-def _count_payments_until_zero(new_loan, monthly_rate, monthly_payment):
-    """
-    Simulate how many monthly payments it takes to pay off new_loan
-    at the given fixed monthly_payment. Returns the number of payments.
-    """
-    balance = new_loan
-    count = 0
-    while balance > 0.01 and count < 10000:
-        interest = balance * monthly_rate
-        principal = monthly_payment - interest
-        if principal <= 0:
-            # Payment can't cover interest — shouldn't happen with valid data
-            break
-        balance = max(balance - principal, 0)
-        count += 1
-    return count
+    return schedule, float(first_payment), float(_r2(total_interest))
 
 
 # ---------------------------------------------------------------------------
@@ -111,39 +146,46 @@ def calc_deposit(amount, annual_rate, term_months, capitalization):
 
 def run_comparison(mortgage, deposit):
     """
-    Compare three strategies:
-      A  — put savings on a deposit (keep paying mortgage as normal)
-      B1 — partial mortgage repayment → reduce remaining term
-      B2 — partial mortgage repayment → reduce monthly payment
+    Compare two strategies:
+      A  — put savings on a deposit (keep paying mortgage as normal),
+           then repay deposit_final → reduce payment
+      B  — partial mortgage repayment now → reduce monthly payment
 
     Args:
         mortgage: dict from DB row (loan_amount, annual_rate, first_payment_date,
-                                    last_payment_date, monthly_payment)
+                                    last_payment_date, monthly_payment,
+                                    adjust_business_days)
         deposit:  dict from DB row (amount, annual_rate, term_months, capitalization)
 
     Returns a dict with all results needed by the comparison route and the frontend.
     """
     monthly_rate = mortgage['annual_rate'] / 100 / 12
+    adj = bool(mortgage.get('adjust_business_days'))
 
     first_dt = datetime.fromisoformat(mortgage['first_payment_date'])
     last_dt = datetime.fromisoformat(mortgage['last_payment_date'])
+    # first_dt is the last payment already made; future schedule starts next month
+    next_dt = first_dt + relativedelta(months=1)
 
-    # Baseline: original mortgage schedule, no changes
-    _, monthly_payment, baseline_total_interest = build_amortization(
+    # Baseline: original mortgage schedule, no changes.
+    # Starts from next_dt (May); first_dt is passed as prev_payment_date
+    # so day-accurate interest for the first future period is correct.
+    base_schedule, monthly_payment, baseline_total_interest = build_amortization(
         mortgage['loan_amount'],
         mortgage['annual_rate'],
-        first_dt,
+        next_dt,
         last_dt,
-        mortgage['monthly_payment'],
+        adjust_business_days=adj,
+        prev_payment_date=first_dt,
+        fixed_payment=mortgage['monthly_payment'],
     )
 
-    original_dates = list(rrule(MONTHLY, dtstart=first_dt, until=last_dt))
-    original_n = len(original_dates)
+    original_n = len(base_schedule)
 
-    # New principal after the lump-sum repayment
+    # New principal after immediate lump-sum repayment
     new_loan = max(mortgage['loan_amount'] - deposit['amount'], 0)
 
-    # --- Strategy A: Deposit ---
+    # --- Strategy A: Deposit for N months, then repay deposit_final → reduce payment ---
     deposit_income, deposit_final = calc_deposit(
         deposit['amount'],
         deposit['annual_rate'],
@@ -151,29 +193,43 @@ def run_comparison(mortgage, deposit):
         deposit['capitalization'],
     )
 
-    # --- Strategy B1: Reduce term (keep same monthly payment) ---
-    new_n_b1 = _count_payments_until_zero(new_loan, monthly_rate, monthly_payment)
-    new_last_date_b1 = first_dt + relativedelta(months=new_n_b1 - 1)
+    term_months = min(deposit['term_months'], original_n)
+    interest_during_deposit = round(sum(row['interest'] for row in base_schedule[:term_months]), 2)
+    balance_after_deposit = base_schedule[term_months - 1]['balance'] if term_months > 0 else mortgage['loan_amount']
 
-    _, _, b1_total_interest = build_amortization(
-        new_loan, mortgage['annual_rate'], first_dt, new_last_date_b1, monthly_payment
+    # base_schedule[0] = May 2026, base_schedule[term_months-1] = first_dt + term_months months.
+    # The NEXT payment after deposit matures is one month later.
+    repayment_dt = first_dt + relativedelta(months=term_months + 1)
+    new_loan_A = max(balance_after_deposit - deposit_final, 0)
+    remaining_n = original_n - term_months
+
+    if new_loan_A <= 0.01 or remaining_n <= 0:
+        interest_after_repayment_A = 0.0
+        deposit_new_monthly = 0.0
+    else:
+        # First month's payment after repayment (for display)
+        deposit_new_monthly = round(new_loan_A * (monthly_rate / (1 - (1 + monthly_rate) ** -remaining_n)), 2)
+        # Full schedule uses dynamic recalculation
+        _, _, interest_after_repayment_A = build_amortization(
+            new_loan_A, mortgage['annual_rate'], repayment_dt, last_dt,
+            adjust_business_days=adj,
+        )
+
+    deposit_net_saving = round(baseline_total_interest - (interest_during_deposit + interest_after_repayment_A), 2)
+
+    # --- Strategy B: Reduce payment (keep same remaining term) ---
+    new_monthly_b = round(new_loan * (monthly_rate / (1 - (1 + monthly_rate) ** -original_n)), 2)
+
+    _, _, b_total_interest = build_amortization(
+        new_loan, mortgage['annual_rate'], next_dt, last_dt,
+        adjust_business_days=adj,
+        prev_payment_date=first_dt,
     )
-    reduce_term_interest_saved = round(baseline_total_interest - b1_total_interest, 2)
-    months_saved = original_n - new_n_b1
-
-    # --- Strategy B2: Reduce payment (keep same remaining term) ---
-    new_monthly_b2 = new_loan * (monthly_rate / (1 - (1 + monthly_rate) ** -original_n))
-    new_monthly_b2 = round(new_monthly_b2, 2)
-
-    _, _, b2_total_interest = build_amortization(
-        new_loan, mortgage['annual_rate'], first_dt, last_dt, new_monthly_b2
-    )
-    reduce_payment_interest_saved = round(baseline_total_interest - b2_total_interest, 2)
+    reduce_payment_interest_saved = round(baseline_total_interest - b_total_interest, 2)
 
     # --- Winner ---
     options = {
-        'deposit': deposit_income,
-        'reduce_term': reduce_term_interest_saved,
+        'deposit': deposit_net_saving,
         'reduce_payment': reduce_payment_interest_saved,
     }
     winner = max(options, key=options.get)
@@ -181,15 +237,17 @@ def run_comparison(mortgage, deposit):
     return {
         'baseline_total_interest': baseline_total_interest,
         'monthly_payment': monthly_payment,
+        'entered_monthly_payment': mortgage['monthly_payment'],
+        'base_schedule': base_schedule,
         # Strategy A
         'deposit_income': deposit_income,
         'deposit_final': deposit_final,
-        # Strategy B1
-        'reduce_term_new_last_date': new_last_date_b1.strftime('%Y-%m-%d'),
-        'reduce_term_months_saved': months_saved,
-        'reduce_term_interest_saved': reduce_term_interest_saved,
-        # Strategy B2
-        'reduce_payment_new_monthly': new_monthly_b2,
+        'deposit_net_saving': deposit_net_saving,
+        'deposit_new_monthly': deposit_new_monthly,
+        'deposit_term_months': deposit['term_months'],
+        'balance_after_deposit': balance_after_deposit,
+        # Strategy B
+        'reduce_payment_new_monthly': new_monthly_b,
         'reduce_payment_interest_saved': reduce_payment_interest_saved,
         # Summary
         'winner': winner,
