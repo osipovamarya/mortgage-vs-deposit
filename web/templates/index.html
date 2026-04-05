@@ -85,6 +85,60 @@
         <small>Если дата выпадает на выходной — сдвигать на понедельник, проценты пересчитываются по фактическим дням</small>
       </div>
 
+      <div class="strategy-section">
+        <h3>Стратегия досрочного погашения</h3>
+        <p class="subtitle">Укажите суммы и даты — калькулятор сравнит досрочное погашение с вкладом.</p>
+
+        <div class="form-group form-group--center">
+          <span class="radio-group-label">При досрочном погашении:</span>
+          <div class="radio-group">
+            <label class="radio-label">
+              <input type="radio" name="repayment_mode" value="reduce_payment" checked>
+              <span>Уменьшить платёж</span>
+            </label>
+            <label class="radio-label">
+              <input type="radio" name="repayment_mode" value="reduce_term">
+              <span>Уменьшить срок</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="lump_sum">Разовое погашение (₽)</label>
+            <input type="number" id="lump_sum" name="lump_sum"
+                   placeholder="500 000" step="0.01" min="0">
+          </div>
+          <div class="form-group">
+            <label for="lump_sum_date">Дата разового погашения</label>
+            <input type="text" id="lump_sum_date" name="lump_sum_date"
+                   placeholder="ДД.ММ.ГГГГ">
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="monthly_budget">Ежемесячный бюджет (₽)</label>
+            <input type="number" id="monthly_budget" name="monthly_budget"
+                   placeholder="33 000" step="0.01" min="0">
+          </div>
+          <div class="form-group">
+            <label for="monthly_start_date">Дата начала ежемесячных</label>
+            <input type="text" id="monthly_start_date" name="monthly_start_date"
+                   placeholder="ДД.ММ.ГГГГ">
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="monthly_extra_day">День досрочного платежа <span class="hint">(число месяца)</span></label>
+            <input type="number" id="monthly_extra_day" name="monthly_extra_day"
+                   placeholder="15" min="1" max="28">
+            <small>Если досрочку делаете в другой день чем аннуитет — например в день зарплаты. Проценты пересчитаются по фактическим дням.</small>
+          </div>
+        </div>
+      </div>
+
       <div id="mortgage-error" class="error-msg hidden"></div>
 
       <button type="submit" class="btn-primary">
@@ -104,30 +158,23 @@
     <form id="form-deposit" novalidate>
       <div class="form-row">
         <div class="form-group">
-          <label for="deposit_amount">Сумма накоплений (₽)</label>
-          <input type="number" id="deposit_amount" name="deposit_amount"
-                 placeholder="500 000" step="0.01" min="1" required>
-        </div>
-        <div class="form-group">
           <label for="deposit_rate">Ставка вклада (% годовых)</label>
           <input type="number" id="deposit_rate" name="deposit_rate"
                  placeholder="16" value="16" step="0.01" min="0.1" required>
         </div>
-      </div>
-
-      <div class="form-row">
         <div class="form-group">
           <label for="deposit_term">Срок вклада (месяцев)</label>
           <input type="number" id="deposit_term" name="deposit_term"
                  placeholder="12" value="12" min="1" max="360" required>
         </div>
-        <div class="form-group form-group--center">
-          <label class="checkbox-label">
-            <input type="checkbox" id="capitalization" name="capitalization" checked>
-            <span>Капитализация процентов</span>
-          </label>
-          <small>Ежемесячное начисление процентов на проценты</small>
-        </div>
+      </div>
+
+      <div class="form-group form-group--center">
+        <label class="checkbox-label">
+          <input type="checkbox" id="capitalization" name="capitalization" checked>
+          <span>Капитализация процентов</span>
+        </label>
+        <small>Ежемесячное начисление процентов на проценты</small>
       </div>
 
       <div id="deposit-error" class="error-msg hidden"></div>
@@ -145,67 +192,94 @@
     <!-- Winner banner -->
     <div class="winner-banner" id="winner-banner"></div>
 
-    <!-- Three scenario cards -->
+    <!-- Scenario cards -->
     <div class="results-grid">
 
-      <div class="result-card result-card--deposit" id="card-deposit">
-        <div class="result-card__icon">💰</div>
-        <h3>Вклад → потом погасить</h3>
-        <div class="result-card__body" id="card-deposit-body"></div>
-      </div>
+          <div class="result-card result-card--params" id="card-params">
+            <div class="result-card__icon">📋</div>
+            <h3>Параметры расчёта</h3>
+            <div class="result-card__body" id="card-params-body"></div>
+          </div>
 
-      <div class="result-card result-card--payment" id="card-reduce-payment">
-        <div class="result-card__icon">📉</div>
-        <h3>Досрочно погасить<br><span class="sub">→ уменьшить платёж</span></h3>
-        <div class="result-card__body" id="card-reduce-payment-body"></div>
-      </div>
+          <div class="result-card result-card--deposit" id="card-deposit">
+            <div class="result-card__icon">💰</div>
+            <h3>Вклад → потом погасить</h3>
+            <div class="result-card__body" id="card-deposit-body"></div>
+          </div>
 
-    </div>
+          <div class="result-card result-card--payment" id="card-reduce-payment">
+            <div class="result-card__icon">📉</div>
+            <h3>Досрочно погасить<br><span class="sub">→ уменьшить платёж</span></h3>
+            <div class="result-card__body" id="card-reduce-payment-body"></div>
+          </div>
 
-    <!-- Chart -->
-    <div class="card chart-card">
-      <h3>Остаток долга по сценариям</h3>
-      <p class="subtitle">Как быстро выплачивается ипотека в каждом из вариантов</p>
-      <canvas id="balance-chart"></canvas>
-    </div>
+          <div class="result-card result-card--term" id="card-reduce-term">
+            <div class="result-card__icon">⏱️</div>
+            <h3>Досрочно погасить<br><span class="sub">→ уменьшить срок</span></h3>
+            <div class="result-card__body" id="card-reduce-term-body"></div>
+          </div>
 
-    <!-- Comparison bar chart -->
-    <div class="card chart-card">
-      <h3>Выгода по сценариям (₽)</h3>
-      <p class="subtitle">Экономия на процентах по ипотеке для каждого сценария</p>
-      <canvas id="gain-chart"></canvas>
-    </div>
+          <div class="result-card result-card--snowball hidden" id="card-snowball">
+            <div class="result-card__icon">🌀</div>
+            <h3>Снежный ком<br><span class="sub">→ ежемесячные досрочки</span></h3>
+            <div class="result-card__body" id="card-snowball-body"></div>
+          </div>
 
-    <!-- Schedule tables -->
-    <div class="card">
-      <div class="table-toggle-row">
-        <h3>График платежей</h3>
-        <div class="tab-buttons">
-          <button class="tab-btn active" data-tab="baseline">Без изменений</button>
-          <button class="tab-btn" data-tab="deposit">Вклад → погасить</button>
-          <button class="tab-btn" data-tab="reduce_payment">Досрочно погасить</button>
+          <div class="result-card result-card--snowball-deposit hidden" id="card-snowball-deposit">
+            <div class="result-card__icon">📈</div>
+            <h3>Вклад вместо досрочек<br><span class="sub">→ копить ту же сумму</span></h3>
+            <div class="result-card__body" id="card-snowball-deposit-body"></div>
+          </div>
+
         </div>
-        <button class="btn-toggle" id="btn-toggle-table">Скрыть таблицу ↑</button>
-      </div>
 
-      <div id="schedule-table-wrap">
-        <div class="table-scroll">
-          <table id="schedule-table">
-            <thead>
-              <tr>
-                <th>№</th>
-                <th>Дата</th>
-                <th>Платёж</th>
-                <th>Основной долг</th>
-                <th>Проценты</th>
-                <th>Остаток</th>
-              </tr>
-            </thead>
-            <tbody id="schedule-tbody"></tbody>
-          </table>
+        <!-- Chart -->
+        <div class="card chart-card">
+          <h3>Остаток долга по сценариям</h3>
+          <p class="subtitle">Как быстро выплачивается ипотека в каждом из вариантов</p>
+          <canvas id="balance-chart"></canvas>
         </div>
-      </div>
-    </div>
+
+        <!-- Comparison bar chart -->
+        <div class="card chart-card">
+          <h3>Выгода по сценариям (₽)</h3>
+          <p class="subtitle">Экономия на процентах по ипотеке для каждого сценария</p>
+          <canvas id="gain-chart"></canvas>
+        </div>
+
+        <!-- Schedule tables -->
+        <div class="card">
+          <div class="table-toggle-row">
+            <h3>График платежей</h3>
+            <div class="tab-buttons">
+              <button class="tab-btn active" data-tab="baseline">Без изменений</button>
+              <button class="tab-btn" data-tab="deposit">Погасить после вклада</button>
+              <button class="tab-btn" data-tab="reduce_payment">Погасить досрочно (платёж)</button>
+              <button class="tab-btn" data-tab="reduce_term">Погасить досрочно (срок)</button>
+              <button class="tab-btn hidden" data-tab="snowball" id="tab-snowball">Снежный ком</button>
+            </div>
+            <button class="btn-toggle" id="btn-toggle-table">Скрыть таблицу ↑</button>
+          </div>
+
+          <div id="schedule-table-wrap">
+            <div class="table-scroll">
+              <table id="schedule-table">
+                <thead>
+                  <tr>
+                    <th>№</th>
+                    <th>Дата</th>
+                    <th>Платёж</th>
+                    <th>Основной долг</th>
+                    <th>Проценты</th>
+                    <th>Остаток</th>
+                  </tr>
+                </thead>
+                <tbody id="schedule-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
 
     <div class="recalc-row">
       <button class="btn-secondary" id="btn-recalc">← Пересчитать</button>

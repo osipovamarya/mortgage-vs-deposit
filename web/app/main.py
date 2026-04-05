@@ -1,5 +1,6 @@
 import os
-from flask import Flask, render_template
+import traceback
+from flask import Flask, render_template, jsonify
 from .database import init_db, close_db
 from .routes.mortgage import mortgage_bp
 from .routes.deposit import deposit_bp
@@ -29,6 +30,16 @@ def create_app():
     @app.route('/')
     def index():
         return render_template('index.html')
+
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        tb = traceback.format_exc()
+        app.logger.error(tb)
+        return jsonify({'error': str(e), 'traceback': tb}), 500
+
+    @app.errorhandler(404)
+    def handle_404(e):
+        return jsonify({'error': 'Не найдено'}), 404
 
     return app
 

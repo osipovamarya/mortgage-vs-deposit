@@ -37,6 +37,26 @@ def create_mortgage():
         fixed_payment=monthly_payment,
     )
 
+    def _float_or_none(key):
+        v = data.get(key)
+        return float(v) if v else None
+
+    def _date_iso_or_none(key):
+        v = data.get(key)
+        if not v:
+            return None
+        try:
+            return datetime.strptime(v, '%d.%m.%Y').strftime('%Y-%m-%d')
+        except ValueError:
+            return v  # already ISO
+
+    lump_sum = _float_or_none('lump_sum')
+    lump_sum_date = _date_iso_or_none('lump_sum_date')
+    monthly_budget = _float_or_none('monthly_budget')
+    monthly_start_date = _date_iso_or_none('monthly_start_date')
+    monthly_extra_day = int(data['monthly_extra_day']) if data.get('monthly_extra_day') else None
+    repayment_mode = data.get('repayment_mode', 'reduce_payment')
+
     db = get_db()
     cursor = db.execute(
         """INSERT INTO mortgage (name, loan_amount, annual_rate, first_payment_date, last_payment_date, monthly_payment, adjust_business_days)
@@ -51,10 +71,19 @@ def create_mortgage():
             adjust_business_days,
         ),
     )
+    mortgage_id = cursor.lastrowid
+
+    strategy_cursor = db.execute(
+        """INSERT INTO repayment_strategy
+           (mortgage_id, lump_sum, lump_sum_date, monthly_budget, monthly_start_date, monthly_extra_day, repayment_mode)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (mortgage_id, lump_sum, lump_sum_date, monthly_budget, monthly_start_date, monthly_extra_day, repayment_mode),
+    )
     db.commit()
 
     return jsonify({
-        'id': cursor.lastrowid,
+        'id': mortgage_id,
+        'strategy_id': strategy_cursor.lastrowid,
         'monthly_payment': monthly_payment,
         'total_interest': total_interest,
         'payment_count': len(schedule),

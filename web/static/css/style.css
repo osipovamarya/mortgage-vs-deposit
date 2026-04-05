@@ -224,6 +224,54 @@ input.invalid { border-color: #EF4444; }
 .summary-block .s-label { font-size: .75rem; color: var(--gray-400); font-weight: 500; }
 .summary-block .s-value { font-weight: 700; color: var(--primary); }
 
+/* ===== Strategy section ===== */
+.strategy-section {
+  margin-top: 1.5rem;
+  padding: 1.25rem;
+  background: var(--gray-50);
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius-sm);
+}
+.strategy-section h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: .3rem;
+  color: var(--gray-700);
+}
+.strategy-section .subtitle {
+  font-size: .85rem;
+  color: var(--gray-500);
+  margin-bottom: 1rem;
+}
+
+/* ===== Radio group ===== */
+.radio-group-label {
+  font-weight: 600;
+  font-size: .875rem;
+  color: var(--gray-700);
+  display: block;
+  margin-bottom: .4rem;
+}
+.radio-group {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  cursor: pointer;
+  font-weight: 500;
+  font-size: .875rem;
+  color: var(--gray-700);
+}
+.radio-label input[type=radio] {
+  width: 16px; height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
 /* ===== Error ===== */
 .error-msg {
   background: #FEF2F2;
@@ -247,6 +295,7 @@ input.invalid { border-color: #EF4444; }
 }
 .winner-banner.deposit  { background: var(--primary-light); color: var(--primary); }
 .winner-banner.repay    { background: var(--success-light); color: var(--success); }
+.winner-banner.snowball { background: #ECFDF5; color: #065F46; }
 .winner-banner .banner-sub {
   font-size: .85rem;
   font-weight: 400;
@@ -272,9 +321,12 @@ input.invalid { border-color: #EF4444; }
   position: relative;
 }
 .result-card:hover { box-shadow: var(--shadow-md); }
-.result-card--deposit { border-top-color: var(--primary); }
-.result-card--term    { border-top-color: var(--success); }
-.result-card--payment { border-top-color: var(--purple); }
+.result-card--deposit  { border-top-color: var(--primary); }
+.result-card--term     { border-top-color: #EA580C; }
+.result-card--payment  { border-top-color: var(--purple); }
+.result-card--snowball { border-top-color: #059669; }
+.result-card--params   { border-top-color: #94A3B8; }
+.result-card--snowball-deposit { border-top-color: #F59E0B; }
 
 .result-card.is-winner::after {
   content: '🏆 Выгоднее';
@@ -318,6 +370,20 @@ input.invalid { border-color: #EF4444; }
 .metric-value.accent   { color: var(--primary); }
 .metric-value.purple   { color: var(--purple); }
 
+.metric--compact { margin-bottom: .35rem; }
+.metric--compact .metric-value { font-size: .95rem; font-weight: 600; }
+.metric--mini { margin-bottom: .6rem; padding-bottom: .6rem; border-bottom: 1px solid var(--gray-100); }
+.metric--mini .metric-value { font-size: .8rem; font-weight: 500; color: var(--gray-500); }
+.params-section-label {
+  font-size: .7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: #94A3B8;
+  margin-bottom: .4rem;
+  margin-top: .1rem;
+}
+
 /* ===== Charts ===== */
 .chart-card { margin-bottom: 1.5rem; }
 .chart-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: .2rem; }
@@ -353,6 +419,19 @@ input.invalid { border-color: #EF4444; }
 
 .table-scroll { overflow-x: auto; margin-top: 1rem; }
 .fact-payment { color: var(--gray-500); font-size: .8rem; white-space: nowrap; }
+tr.row-early { background: #F0FDF4; }
+tr.row-early > td:first-child { border-left: 3px solid #059669; }
+.early-badge {
+  display: inline-block;
+  margin-left: .4rem;
+  padding: .1rem .45rem;
+  background: #DCFCE7;
+  color: #166534;
+  border-radius: 999px;
+  font-size: .75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
 table { width: 100%; border-collapse: collapse; font-size: .875rem; }
 thead tr { background: var(--gray-100); }
 th {
