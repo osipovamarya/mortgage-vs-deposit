@@ -327,12 +327,23 @@ function renderCards(d) {
     const capLabel = dep.capitalization ? 'с капитализацией' : 'без капитализации';
     const depMortgageInterest = totalInterest(d.schedules.deposit);
     const depSaved = d._totals.baseline - d._totals.deposit;
-    const depositPaymentRow = mode === 'reduce_payment'
+    // What the repayment buys: a smaller payment, or an earlier end date
+    const depEndDate     = scheduleEndDate(d.schedules.deposit);
+    const baseEndDate    = scheduleEndDate(d.schedules.baseline);
+    const depMonthsSaved = (depEndDate && baseEndDate) ? monthsBetween(depEndDate, baseEndDate) : 0;
+    const depositOutcomeRows = mode === 'reduce_payment'
       ? `<div class="metric">
           <div class="metric-label">Новый платёж после погашения</div>
           <div class="metric-value purple">${rub(d.deposit_new_monthly)} / мес.</div>
         </div>`
-      : '';
+      : `<div class="metric">
+          <div class="metric-label">Ипотека закроется</div>
+          <div class="metric-value purple">${depEndDate ? fmtDate(depEndDate) : '—'}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Срок сокращается на</div>
+          <div class="metric-value accent">${fmtMonths(depMonthsSaved)}</div>
+        </div>`;
     document.getElementById('card-deposit-body').innerHTML = `
       <div class="metric metric--mini">
         <div class="metric-label">Ставка вклада</div>
@@ -350,7 +361,7 @@ function renderCards(d) {
         <div class="metric-label">Итого выплат</div>
         <div class="metric-value accent">${rub(d._totals.deposit)}</div>
       </div>
-      ${depositPaymentRow}
+      ${depositOutcomeRows}
       <div class="metric--vs">на ${rub(depSaved)} меньше чем ничего не делать</div>
     `;
   }
