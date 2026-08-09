@@ -47,9 +47,14 @@ CREATE TABLE IF NOT EXISTS comparison (
     deposit_net_saving              REAL,
     deposit_new_monthly             REAL,
 
-    -- Strategy B: lump sum immediate early repayment → reduce payment
+    -- Strategy B1: lump sum early repayment → reduce payment
     reduce_payment_new_monthly      REAL,
     reduce_payment_interest_saved   REAL,
+
+    -- Strategy B2: lump sum early repayment → reduce term
+    reduce_term_interest_saved      REAL,
+    reduce_term_months_saved        INTEGER,
+    reduce_term_months_to_payoff    INTEGER,
 
     -- Strategy C: snowball (monthly_budget - required_payment goes to early repayment each month)
     snowball_total_interest         REAL,
@@ -76,6 +81,25 @@ def _schema_is_current(conn):
         return False
 
 
+# Columns added after the initial schema. Applied with ALTER TABLE so that
+# saved comparisons survive the upgrade.
+_ADDED_COLUMNS = {
+    'comparison': {
+        'reduce_term_interest_saved':   'REAL',
+        'reduce_term_months_saved':     'INTEGER',
+        'reduce_term_months_to_payoff': 'INTEGER',
+    },
+}
+
+
+def _apply_added_columns(conn):
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {decl}')
+
+
 def init_db(db_path):
     """Create or reset tables to match the current schema."""
     db_dir = os.path.dirname(os.path.abspath(db_path))
@@ -92,6 +116,7 @@ def init_db(db_path):
         """)
 
     conn.executescript(SCHEMA)
+    _apply_added_columns(conn)
     conn.commit()
     conn.close()
 

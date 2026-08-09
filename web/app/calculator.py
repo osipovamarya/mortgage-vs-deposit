@@ -55,7 +55,7 @@ def _date_to_idx(target_date, scheduled_dates):
     for i, d in enumerate(scheduled_dates):
         if d >= target_date:
             return i
-    return 0  # past end → apply immediately (conservative)
+    return len(scheduled_dates)  # past end → strategy never kicks in
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +176,171 @@ def calc_monthly_deposit(initial, monthly_addition, annual_rate, capitalization,
             income += float(monthly_addition) * monthly_rate * (months - k)
         balance = float(initial) + float(monthly_addition) * months + income
     return round(income, 2), round(balance, 2)
+
+
+# ---------------------------------------------------------------------------
+# Single lump-sum early repayment
+# ---------------------------------------------------------------------------
+
+def simulate_lump_repayment(loan_amount, annual_rate, first_payment_date, last_payment_date,
+                            monthly_payment, lump_sum, lump_date, mode='reduce_payment',
+                            adjust_business_days=False, prev_payment_date=None):
+    """
+    Simulate one lump-sum early repayment on top of the regular annuity.
+
+    Core rule: an early repayment goes 100% into the principal and NEVER pays
+    off interest. Interest already accrued for the running period is charged in
+    full on the pre-repayment balance:
+
+      * lump on a payment date  → applied AFTER that date's annuity, so that
+                                  payment's interest is the baseline one;
+      * lump between payments   → that period's interest is split by days:
+                                  pre-lump days on the old balance, post-lump
+                                  days on the reduced one (daily accrual);
+      * lump before the first upcoming payment (or no date given) → applied
+                                  immediately, whole first period on the
+                                  reduced balance.
+
+    mode:
+      'reduce_payment' — same end date, annuity recalculated after the lump
+      'reduce_term'    — same monthly payment, loan closes earlier
+
+    Returns: (schedule, monthly_payment_after_lump, total_interest, annuity_months)
+    `annuity_months` counts real payments only, early-repayment rows excluded.
+    """
+    if isinstance(first_payment_date, str):
+        first_payment_date = _parse_date(first_payment_date)
+    if isinstance(last_payment_date, str):
+        last_payment_date = _parse_date(last_payment_date)
+    if isinstance(lump_date, str):
+        lump_date = _parse_date(lump_date)
+
+    annual_rate_d = _d(annual_rate)
+    rate = annual_rate_d / _d(100) / _d(12)
+    daily_rate = annual_rate_d / _d(100) / _d(365)
+
+    scheduled = list(rrule(MONTHLY, dtstart=first_payment_date, until=last_payment_date))
+    n = len(scheduled)
+
+    if adjust_business_days:
+        dates = [_next_business_day(d) for d in scheduled]
+        _prev = prev_payment_date if prev_payment_date is not None else (first_payment_date - relativedelta(months=1))
+        prev_date = _next_business_day(_prev)
+    else:
+        dates = scheduled
+        prev_date = prev_payment_date if prev_payment_date is not None else (first_payment_date - relativedelta(months=1))
+
+    balance = _d(loan_amount)
+    lump_d = _d(lump_sum or 0)
+
+    def _annuity(bal, periods):
+        """Annuity payment closing `bal` over `periods` months."""
+        if periods <= 0 or bal <= Decimal('0'):
+            return Decimal('0')
+        factor = (1 + rate) ** periods
+        return _r2(bal * rate * factor / (factor - 1))
+
+    payment = _d(monthly_payment) if monthly_payment else _annuity(balance, n)
+
+    def _early_row(date, amount, bal_after):
+        return {
+            'payment_num': 0,
+            'date': date.strftime('%d.%m.%Y'),
+            'payment': float(amount),
+            'principal': float(amount),
+            'interest': 0.0,            # early repayment never pays interest
+            'balance': float(_r2(bal_after)),
+            'early': float(amount),
+        }
+
+    schedule = []
+    total_interest = Decimal('0')
+    annuity_months = 0
+    lump_pending = lump_d > Decimal('0')
+    split = None  # (lump_date, balance_before_lump) → next payment's interest is split
+
+    # Lump made before the first upcoming payment, or with no date at all.
+    if lump_pending and (lump_date is None or lump_date <= prev_date):
+        amount = min(lump_d, balance)
+        balance -= amount
+        schedule.append(_early_row(lump_date or prev_date, amount, balance))
+        if mode == 'reduce_payment':
+            payment = _annuity(balance, n)
+        lump_pending = False
+
+    for i, date in enumerate(dates):
+        if balance <= Decimal('0.01'):
+            break
+
+        # ── Early repayment falling strictly inside the current period ──────
+        if lump_pending and lump_date is not None and prev_date < lump_date < date:
+            bal_before = balance
+            amount = min(lump_d, balance)
+            balance -= amount
+            schedule.append(_early_row(lump_date, amount, balance))
+            split = (lump_date, bal_before)
+            lump_pending = False
+            if mode == 'reduce_payment':
+                payment = _annuity(balance, n - i)
+            if balance <= Decimal('0.01'):
+                break
+
+        # ── Interest for this period ────────────────────────────────────────
+        if split is not None:
+            lump_dt, bal_before = split
+            days1 = (lump_dt - prev_date).days
+            days2 = (date - lump_dt).days
+            interest = _r2(
+                bal_before * daily_rate * _d(days1) +
+                balance    * daily_rate * _d(days2)
+            )
+            split = None
+        elif adjust_business_days:
+            interest = _r2(balance * daily_rate * _d((date - prev_date).days))
+        else:
+            interest = _r2(balance * rate)
+
+        # ── Regular annuity ─────────────────────────────────────────────────
+        if i == n - 1 or payment >= balance + interest:
+            principal = _r2(balance)
+            pay_amount = _r2(principal + interest)
+        else:
+            pay_amount = payment
+            principal = _r2(pay_amount - interest)
+            if principal < Decimal('0'):
+                principal = Decimal('0')
+
+        balance = max(balance - principal, Decimal('0'))
+        total_interest += interest
+        annuity_months += 1
+        prev_date = date
+
+        schedule.append({
+            'payment_num': 0,
+            'date': date.strftime('%d.%m.%Y'),
+            'payment': float(pay_amount),
+            'principal': float(principal),
+            'interest': float(interest),
+            'balance': float(_r2(balance)),
+            'early': 0.0,
+        })
+
+        # ── Early repayment on the payment date — strictly AFTER the annuity ─
+        if lump_pending and lump_date is not None and lump_date == date and balance > Decimal('0.01'):
+            amount = min(lump_d, balance)
+            balance -= amount
+            schedule.append(_early_row(date, amount, balance))
+            lump_pending = False
+            if mode == 'reduce_payment':
+                payment = _annuity(balance, n - i - 1)
+
+        if balance <= Decimal('0.01'):
+            break
+
+    for idx, row in enumerate(schedule):
+        row['payment_num'] = idx + 1
+
+    return schedule, float(payment), float(_r2(total_interest)), annuity_months
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +595,6 @@ def run_comparison(mortgage, deposit, strategy=None):
     The amount for both deposit and repayment is strategy.lump_sum.
     """
     strategy = strategy or {}
-    monthly_rate = mortgage['annual_rate'] / 100 / 12
     adj = bool(mortgage.get('adjust_business_days'))
 
     first_dt = _parse_date(mortgage['first_payment_date'])
@@ -463,12 +627,23 @@ def run_comparison(mortgage, deposit, strategy=None):
         fixed_payment=mortgage['monthly_payment'],
     )
 
-    # --- Strategy A: deposit lump_sum for T months, then repay → reduce payment ---
+    repayment_mode = strategy.get('repayment_mode') or 'reduce_payment'
+
+    def _lump_run(amount, at_date, mode):
+        """One lump-sum repayment on the current mortgage. Never touches interest."""
+        return simulate_lump_repayment(
+            mortgage['loan_amount'], mortgage['annual_rate'], next_dt, last_dt,
+            mortgage['monthly_payment'], amount, at_date, mode=mode,
+            adjust_business_days=adj, prev_payment_date=first_dt,
+        )
+
+    # --- Strategy A: keep lump_sum on deposit for T months, then repay ---
     deposit_income = 0.0
     deposit_final = 0.0
     deposit_net_saving = 0.0
     deposit_new_monthly = 0.0
     balance_after_deposit = mortgage['loan_amount']
+    deposit_schedule = list(base_schedule)
 
     if lump_sum > 0 and deposit:
         term_months = min(deposit['term_months'], original_n)
@@ -480,30 +655,14 @@ def run_comparison(mortgage, deposit, strategy=None):
             term_months,
         )
 
-        interest_during_deposit = round(
-            sum(row['interest'] for row in base_schedule[:term_months]), 2
-        )
         balance_after_deposit = base_schedule[term_months - 1]['balance'] if term_months > 0 else mortgage['loan_amount']
 
-        repayment_dt = first_dt + relativedelta(months=term_months + 1)
-        new_loan_A = max(balance_after_deposit - deposit_final, 0)
-        remaining_n = original_n - term_months
-
-        if new_loan_A <= 0.01 or remaining_n <= 0:
-            interest_after_repayment_A = 0.0
-            deposit_new_monthly = 0.0
-        else:
-            deposit_new_monthly = round(
-                new_loan_A * (monthly_rate / (1 - (1 + monthly_rate) ** -remaining_n)), 2
-            )
-            _, _, interest_after_repayment_A = build_amortization(
-                new_loan_A, mortgage['annual_rate'], repayment_dt, last_dt,
-                adjust_business_days=adj,
-            )
-
-        deposit_net_saving = round(
-            baseline_total_interest - (interest_during_deposit + interest_after_repayment_A), 2
+        # Money becomes available right after the payment that closes the deposit term.
+        deposit_lump_date = scheduled_dates[term_months - 1] if term_months > 0 else None
+        deposit_schedule, deposit_new_monthly, interest_A, _ = _lump_run(
+            deposit_final, deposit_lump_date, repayment_mode,
         )
+        deposit_net_saving = round(baseline_total_interest - interest_A, 2)
 
     # --- Strategy B1: lump_sum → reduce payment (lower annuity, same term) ---
     # --- Strategy B2: lump_sum → reduce term  (same payment, shorter term) ---
@@ -512,39 +671,21 @@ def run_comparison(mortgage, deposit, strategy=None):
     reduce_term_interest_saved = 0.0
     reduce_term_months_to_payoff = original_n
     reduce_term_months_saved = 0
+    reduce_payment_schedule = list(base_schedule)
+    reduce_term_schedule = list(base_schedule)
 
     if lump_sum > 0:
-        interest_before = sum(row['interest'] for row in base_schedule[:lump_idx])
-        balance_at_lump = base_schedule[lump_idx - 1]['balance'] if lump_idx > 0 else mortgage['loan_amount']
-        new_loan_b = max(balance_at_lump - lump_sum, 0)
-        remaining_b = original_n - lump_idx
-        repayment_dt_b = next_dt + relativedelta(months=lump_idx)
+        reduce_payment_schedule, new_monthly_b, interest_b1, _ = _lump_run(
+            lump_sum, lump_sum_date, 'reduce_payment',
+        )
+        reduce_payment_interest_saved = round(baseline_total_interest - interest_b1, 2)
 
-        if new_loan_b > 0.01 and remaining_b > 0:
-            # B1: reduce payment
-            new_monthly_b = round(
-                new_loan_b * (monthly_rate / (1 - (1 + monthly_rate) ** -remaining_b)), 2
-            )
-            _, _, interest_after_b1 = build_amortization(
-                new_loan_b, mortgage['annual_rate'], repayment_dt_b, last_dt,
-                adjust_business_days=adj,
-                fixed_payment=new_monthly_b,
-            )
-            reduce_payment_interest_saved = round(
-                baseline_total_interest - (interest_before + interest_after_b1), 2
-            )
-
-            # B2: reduce term
-            sched_b2, _, interest_after_b2 = build_amortization(
-                new_loan_b, mortgage['annual_rate'], repayment_dt_b, last_dt,
-                adjust_business_days=adj,
-                fixed_payment=mortgage['monthly_payment'],
-            )
-            reduce_term_months_to_payoff = lump_idx + len(sched_b2)
-            reduce_term_months_saved = original_n - reduce_term_months_to_payoff
-            reduce_term_interest_saved = round(
-                baseline_total_interest - (interest_before + interest_after_b2), 2
-            )
+        reduce_term_schedule, _, interest_b2, months_b2 = _lump_run(
+            lump_sum, lump_sum_date, 'reduce_term',
+        )
+        reduce_term_interest_saved = round(baseline_total_interest - interest_b2, 2)
+        reduce_term_months_to_payoff = months_b2
+        reduce_term_months_saved = original_n - months_b2
 
     # --- Strategy C: snowball ---
     snowball_fields = {}
@@ -622,6 +763,10 @@ def run_comparison(mortgage, deposit, strategy=None):
         'entered_monthly_payment': mortgage['monthly_payment'],
         'base_schedule': base_schedule,
         'balance_after_deposit': balance_after_deposit,
+        # Full schedules (popped by the route, never stored in the DB)
+        'deposit_schedule': deposit_schedule,
+        'reduce_payment_schedule': reduce_payment_schedule,
+        'reduce_term_schedule': reduce_term_schedule,
         # Strategy A
         'deposit_income': deposit_income,
         'deposit_final': deposit_final,

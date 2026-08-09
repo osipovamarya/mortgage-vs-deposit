@@ -231,6 +231,22 @@ income = P * (annual_rate/100) * (term_months/12)
 ```
 
 ### Partial Repayment
+
+**Invariant: an early repayment goes 100% into the principal and never pays interest.**
+Interest already accrued for the running period is charged in full on the pre-repayment
+balance. Implemented in `simulate_lump_repayment()` — the single entry point for every
+lump-sum scenario (deposit-then-repay, reduce payment, reduce term) and the source of
+both the totals and the schedules shown in the UI:
+
+- lump **on** a payment date → applied *after* that date's annuity, so that payment's
+  interest equals the baseline one;
+- lump **between** payments → the period's interest is split by days: pre-lump days on
+  the old balance, post-lump days on the reduced one;
+- lump **before** the first upcoming payment (or with no date) → applied at once.
+
+`calc_repayment_schedule()` (snowball) follows the same rule: extra-payment rows always
+carry `interest = 0`.
+
 After applying `deposit.amount` as a lump-sum payment to the remaining principal:
 
 **Reduce term:** recalculate `n` keeping monthly payment the same → new `last_payment_date`.

@@ -209,7 +209,7 @@ function renderResults(d) {
     baseline:       baseTotal,
     deposit:        state.hasLumpSum ? totalInterest(d.schedules.deposit) - Math.round(d.deposit_income) : null,
     reduce_payment: mode === 'reduce_payment' ? totalInterest(d.schedules.reduce_payment) : null,
-    reduce_term:    mode === 'reduce_term'    ? totalInterest(d.schedules.reduce_payment) : null,
+    reduce_term:    mode === 'reduce_term'    ? totalInterest(d.schedules.reduce_term)    : null,
     snowball:       d.snowball_interest_saved != null ? totalInterest(d.schedules.snowball) : null,
   };
 
@@ -315,16 +315,11 @@ function renderCards(d) {
   document.getElementById('card-reduce-payment').classList.toggle('hidden', mode !== 'reduce_payment' || !hasEarly);
   document.getElementById('card-reduce-term').classList.toggle('hidden',    mode !== 'reduce_term'    || !hasEarly);
 
-  // Update table tab labels and visibility
+  // Each mode has its own schedule — show only the tab for the chosen one
   const tabRp = document.querySelector('.tab-btn[data-tab="reduce_payment"]');
   const tabRt = document.querySelector('.tab-btn[data-tab="reduce_term"]');
-  tabRt.classList.add('hidden');
-  if (!hasEarly) {
-    tabRp.classList.add('hidden');
-  } else {
-    tabRp.classList.remove('hidden');
-    tabRp.textContent = mode === 'reduce_term' ? 'Погасить досрочно (срок)' : 'Погасить досрочно (платёж)';
-  }
+  tabRp.classList.toggle('hidden', !hasEarly || mode !== 'reduce_payment');
+  tabRt.classList.toggle('hidden', !hasEarly || mode !== 'reduce_term');
 
   // Deposit card (lump_sum scenario)
   if (state.hasLumpSum) {
@@ -376,7 +371,7 @@ function renderCards(d) {
   `;
 
   // Reduce term card
-  const rtEndDate = scheduleEndDate(d.schedules.reduce_payment);
+  const rtEndDate = scheduleEndDate(d.schedules.reduce_term);
   const rtTotal = d._totals.reduce_term;
   const rtSaved = d._totals.baseline - rtTotal;
   document.getElementById('card-reduce-term-body').innerHTML = `
@@ -556,7 +551,7 @@ function renderChartBalance(schedules, mode, hasEarly, snowballDepositSeries) {
   if (hasEarly) {
     datasets.push({
       label: rpLabel,
-      data: alignSeries(schedules.reduce_payment, baseLabels),
+      data: alignSeries(mode === 'reduce_term' ? schedules.reduce_term : schedules.reduce_payment, baseLabels),
       borderColor: rpColor,
       backgroundColor: rpBg,
       borderWidth: 2.5,
