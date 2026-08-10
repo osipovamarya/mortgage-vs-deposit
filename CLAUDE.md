@@ -29,6 +29,7 @@ mortgage_calc/
 │   │   ├── __init__.py
 │   │   ├── main.py               # Flask app factory + entry point
 │   │   ├── database.py           # SQLite connection, schema migrations
+│   │   ├── engine.py             # Событийный движок графика платежей (И1)
 │   │   ├── calculator.py         # Deposit + comparison calculation logic
 │   │   └── routes/
 │   │       ├── __init__.py
@@ -91,6 +92,7 @@ DB_PATH=../db/mortgage_web.db PYTHONPATH=.. flask --app app/main.py run
 
 **Calculation logic:**
 - Mortgage annuity payment and schedule: reused from `tgapp_legacy/mortgage.py`
+- Mortgage schedule and early repayment: `web/app/engine.py` (событийный движок)
 - Deposit compound interest: implemented in `web/app/calculator.py`
 - Comparison logic: implemented in `web/app/calculator.py`
 
@@ -208,7 +210,7 @@ GET    /api/comparison            List all comparisons (history)
 
 ---
 
-## Calculation Logic (web/app/calculator.py)
+## Calculation Logic (web/app/engine.py + web/app/calculator.py)
 
 ### Mortgage (reused from app/mortgage.py)
 Annuity payment formula:
@@ -232,20 +234,45 @@ income = P * (annual_rate/100) * (term_months/12)
 
 ### Partial Repayment
 
-**Invariant: an early repayment goes 100% into the principal and never pays interest.**
-Interest already accrued for the running period is charged in full on the pre-repayment
-balance. Implemented in `simulate_lump_repayment()` — the single entry point for every
-lump-sum scenario (deposit-then-repay, reduce payment, reduce term) and the source of
-both the totals and the schedules shown in the UI:
+Считается событийным движком `web/app/engine.py`. `simulate_lump_repayment()` —
+тонкая обёртка над ним и единственная точка входа для всех сценариев с разовой
+суммой (вклад → погасить, уменьшить платёж, уменьшить срок); она же даёт и итоги,
+и графики, которые видит пользователь.
 
+**Правило распределения досрочки выбирается пользователем (`early_repayment_allocation`),
+дефолт — `principal_only`.**
+
+`principal_only` — **инвариант, действующий по умолчанию: досрочка идёт на 100 % в тело
+долга и никогда не оплачивает проценты.** Проценты, уже начисленные за текущий период,
+предъявляются полностью и считаются от остатка ДО досрочки. Строка досрочки в графике
+имеет `interest = 0`. Инвариант зафиксирован коммитом `3ca4b3e` и держится структурно:
+событие только закрывает текущий сегмент начисления и открывает следующий.
+
+`interest_first` — из досрочки сначала удерживаются проценты, начисленные с прошлого
+платежа по дату досрочки, остаток идёт в тело. Курсор сегмента сдвигается на дату
+досрочки, поэтому ближайший аннуитет начисляет проценты только за оставшиеся дни —
+двойного начисления нет. Если досрочка меньше начисленных процентов, проценты
+удерживаются в пределах внесённой суммы, тело не уменьшается, а непокрытый остаток
+(`carried_interest`) прибавляется к процентам ближайшего аннуитета.
+
+Три точки применения (в первых двух режимы **тождественны**):
+
+- lump **before** the first upcoming payment (or with no date) → applied at once;
+  накопленного периода ещё нет;
 - lump **on** a payment date → applied *after* that date's annuity, so that payment's
-  interest equals the baseline one;
-- lump **between** payments → the period's interest is split by days: pre-lump days on
-  the old balance, post-lump days on the reduced one;
-- lump **before** the first upcoming payment (or with no date) → applied at once.
+  interest equals the baseline one; проценты периода уже закрыты аннуитетом;
+- lump **between** payments → период делится на отрезки; здесь режимы расходятся.
 
-`calc_repayment_schedule()` (snowball) follows the same rule: extra-payment rows always
-carry `interest = 0`.
+База начисления фиксируется один раз на весь расчёт и берётся только из
+`adjust_business_days`: `monthly` (период стоит `balance * rate/12`, при дроблении эта же
+сумма распределяется между отрезками пропорционально дням) или `daily`
+(`balance * rate/365 * дни`). Смешивать базы нельзя.
+
+Каждая строка графика несёт `row_kind` (`'annuity' | 'early'`) и `early_interest` — вид
+строки приходит из движка, а не угадывается фронтом по `interest == 0`.
+
+`calc_repayment_schedule()` (snowball) — пока отдельная реализация (переезжает на движок
+на Итерации 3), но следует тому же правилу: строки доплаты всегда несут `interest = 0`.
 
 After applying `deposit.amount` as a lump-sum payment to the remaining principal:
 

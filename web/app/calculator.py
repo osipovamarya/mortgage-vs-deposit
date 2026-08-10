@@ -3,46 +3,37 @@ Core financial calculation logic.
 
 All mortgage calculations use the annuity (равные платежи) method.
 Deposit calculations support both compound (капитализация) and simple interest.
+
+`build_amortization()` и `simulate_lump_repayment()` — тонкие обёртки над
+событийным движком `app/engine.py`: сам помесячный цикл, начисление процентов
+сегментами и правило распределения досрочки живут там. `calc_repayment_schedule()`
+(снежный ком) остаётся отдельной реализацией до Итерации 3.
 """
-from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from dateutil.rrule import rrule, MONTHLY
 from dateutil.relativedelta import relativedelta
 
+from .engine import (
+    ALLOC_PRINCIPAL_ONLY,
+    ROW_ANNUITY,
+    ROW_EARLY,
+    MortgageState,
+    RepaymentEvent,
+    SimOptions,
+    basis_for,
+    simulate_strategy,
+    _d,
+    _next_business_day,
+    _parse_date,
+    _r2,
+)
+
 _CENT = Decimal('0.01')
-
-def _d(x):
-    return Decimal(str(x))
-
-def _r2(x):
-    return x.quantize(_CENT, rounding=ROUND_HALF_UP)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _next_business_day(date):
-    """Move Saturday → Monday, Sunday → Monday. No holiday calendar."""
-    wd = date.weekday()
-    if wd == 5:
-        return date + timedelta(days=2)
-    if wd == 6:
-        return date + timedelta(days=1)
-    return date
-
-
-def _parse_date(value):
-    """Parse DD.MM.YYYY or ISO date string to datetime."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.strptime(value, '%d.%m.%Y')
-    except ValueError:
-        return datetime.fromisoformat(value)
-
 
 def _date_to_idx(target_date, scheduled_dates):
     """
@@ -67,10 +58,43 @@ def build_amortization(loan_amount, annual_rate, first_payment_date, last_paymen
     """
     Generate a full month-by-month amortization schedule.
 
+    Тонкая обёртка над движком: график без досрочек — это `simulate_strategy()`
+    с пустым списком событий. Сигнатура и возвращаемый кортеж не менялись.
+
     Returns:
         schedule        — list of dicts, one per payment
         first_payment   — payment amount of the first period
         total_interest  — sum of all interest portions
+    """
+    if fixed_payment is None:
+        # Мёртвая ветка: все вызывающие передают fixed_payment. Оставлена здесь
+        # как есть и в движок не переезжает (роадмап, Итерация 1).
+        return _amortization_without_fixed_payment(
+            loan_amount, annual_rate, first_payment_date, last_payment_date,
+            adjust_business_days, prev_payment_date,
+        )
+
+    state = MortgageState(
+        loan_amount=loan_amount,
+        annual_rate=annual_rate,
+        first_payment_date=_parse_date(first_payment_date),
+        last_payment_date=_parse_date(last_payment_date),
+        prev_payment_date=_parse_date(prev_payment_date),
+        contract_payment=fixed_payment,
+    )
+    result = simulate_strategy(state, [], SimOptions(basis=basis_for(adjust_business_days)))
+    return result.schedule, result.schedule[0]['payment'], result.total_interest
+
+
+def _amortization_without_fixed_payment(loan_amount, annual_rate,
+                                        first_payment_date, last_payment_date,
+                                        adjust_business_days, prev_payment_date):
+    """
+    Старая ветка `build_amortization()` без договорного платежа.
+
+    Платёж пересчитывается каждый месяц, а остаток срока берётся не из сетки, а
+    из `days_left / 365 * 12`. Ветка мёртвая — ни один вызывающий сюда не
+    попадает; сохранена без изменений, чтобы не потерять поведение молча.
     """
     if isinstance(first_payment_date, str):
         first_payment_date = _parse_date(first_payment_date)
@@ -86,7 +110,7 @@ def build_amortization(loan_amount, annual_rate, first_payment_date, last_paymen
     if adjust_business_days:
         dates = [_next_business_day(d) for d in scheduled]
         _prev = prev_payment_date if prev_payment_date is not None else (first_payment_date - relativedelta(months=1))
-        prev_date = _next_business_day(_prev)
+        prev_date = _next_business_day(_parse_date(_prev))
     else:
         dates = scheduled
         prev_date = None
@@ -107,13 +131,6 @@ def build_amortization(loan_amount, annual_rate, first_payment_date, last_paymen
         if i == n - 1:
             principal = _r2(balance)
             payment = _r2(principal + interest)
-        elif fixed_payment is not None:
-            payment = _d(fixed_payment)
-            principal = _r2(payment - interest)
-            if principal >= balance:
-                # Loan pays off early — treat as final payment
-                principal = _r2(balance)
-                payment = _r2(principal + interest)
         else:
             days_left = (last_payment_date - date).days
             remaining_n = max(round(days_left / 365 * 12), 1)
@@ -136,6 +153,8 @@ def build_amortization(loan_amount, annual_rate, first_payment_date, last_paymen
             'interest': float(interest),
             'balance': float(_r2(balance)),
             'early': 0.0,
+            'row_kind': ROW_ANNUITY,
+            'early_interest': 0.0,
         })
 
         if balance <= Decimal('0.01'):
@@ -184,22 +203,31 @@ def calc_monthly_deposit(initial, monthly_addition, annual_rate, capitalization,
 
 def simulate_lump_repayment(loan_amount, annual_rate, first_payment_date, last_payment_date,
                             monthly_payment, lump_sum, lump_date, mode='reduce_payment',
-                            adjust_business_days=False, prev_payment_date=None):
+                            adjust_business_days=False, prev_payment_date=None,
+                            allocation=None):
     """
     Simulate one lump-sum early repayment on top of the regular annuity.
 
-    Core rule: an early repayment goes 100% into the principal and NEVER pays
-    off interest. Interest already accrued for the running period is charged in
-    full on the pre-repayment balance:
+    Тонкая обёртка над движком: одна разовая досрочка — это одно событие.
 
-      * lump on a payment date  → applied AFTER that date's annuity, so that
-                                  payment's interest is the baseline one;
-      * lump between payments   → that period's interest is split by days:
-                                  pre-lump days on the old balance, post-lump
-                                  days on the reduced one (daily accrual);
-      * lump before the first upcoming payment (or no date given) → applied
-                                  immediately, whole first period on the
-                                  reduced balance.
+    Правило распределения (`allocation`, None → `principal_only`):
+
+      * `principal_only` (ИНВАРИАНТ, дефолт) — досрочка уходит на 100 % в тело и
+        никогда не оплачивает проценты. Проценты за уже прошедший отрезок
+        начислены на добытийный остаток и предъявляются ближайшим аннуитетом;
+      * `interest_first` — из досрочки сначала удерживаются проценты, начисленные
+        с прошлого платежа по дату досрочки, остаток идёт в тело. Курсор
+        сегмента начисления сдвигается на дату досрочки, поэтому ближайший
+        аннуитет считает проценты только за оставшиеся дни.
+
+    Три точки применения:
+
+      * досрочка **в дату платежа** — после аннуитета этой даты, поэтому её
+        проценты равны baseline-процентам того же месяца, а режимы распределения
+        тождественны (проценты периода уже закрыты);
+      * досрочка **между платежами** — период делится на два отрезка;
+      * досрочка **до первого предстоящего платежа** или без даты — применяется
+        сразу, накопленного периода ещё нет, режимы снова тождественны.
 
     mode:
       'reduce_payment' — same end date, annuity recalculated after the lump
@@ -208,139 +236,30 @@ def simulate_lump_repayment(loan_amount, annual_rate, first_payment_date, last_p
     Returns: (schedule, monthly_payment_after_lump, total_interest, annuity_months)
     `annuity_months` counts real payments only, early-repayment rows excluded.
     """
-    if isinstance(first_payment_date, str):
-        first_payment_date = _parse_date(first_payment_date)
-    if isinstance(last_payment_date, str):
-        last_payment_date = _parse_date(last_payment_date)
-    if isinstance(lump_date, str):
-        lump_date = _parse_date(lump_date)
+    state = MortgageState(
+        loan_amount=loan_amount,
+        annual_rate=annual_rate,
+        first_payment_date=_parse_date(first_payment_date),
+        last_payment_date=_parse_date(last_payment_date),
+        prev_payment_date=_parse_date(prev_payment_date),
+        contract_payment=monthly_payment,
+    )
+    opts = SimOptions(
+        basis=basis_for(adjust_business_days),
+        allocation=allocation or ALLOC_PRINCIPAL_ONLY,
+    )
 
-    annual_rate_d = _d(annual_rate)
-    rate = annual_rate_d / _d(100) / _d(12)
-    daily_rate = annual_rate_d / _d(100) / _d(365)
+    events = []
+    if _d(lump_sum or 0) > Decimal('0'):
+        events.append(RepaymentEvent(
+            amount=lump_sum,
+            at=_parse_date(lump_date),
+            mode=mode,
+        ))
 
-    scheduled = list(rrule(MONTHLY, dtstart=first_payment_date, until=last_payment_date))
-    n = len(scheduled)
-
-    if adjust_business_days:
-        dates = [_next_business_day(d) for d in scheduled]
-        _prev = prev_payment_date if prev_payment_date is not None else (first_payment_date - relativedelta(months=1))
-        prev_date = _next_business_day(_prev)
-    else:
-        dates = scheduled
-        prev_date = prev_payment_date if prev_payment_date is not None else (first_payment_date - relativedelta(months=1))
-
-    balance = _d(loan_amount)
-    lump_d = _d(lump_sum or 0)
-
-    def _annuity(bal, periods):
-        """Annuity payment closing `bal` over `periods` months."""
-        if periods <= 0 or bal <= Decimal('0'):
-            return Decimal('0')
-        factor = (1 + rate) ** periods
-        return _r2(bal * rate * factor / (factor - 1))
-
-    payment = _d(monthly_payment) if monthly_payment else _annuity(balance, n)
-
-    def _early_row(date, amount, bal_after):
-        return {
-            'payment_num': 0,
-            'date': date.strftime('%d.%m.%Y'),
-            'payment': float(amount),
-            'principal': float(amount),
-            'interest': 0.0,            # early repayment never pays interest
-            'balance': float(_r2(bal_after)),
-            'early': float(amount),
-        }
-
-    schedule = []
-    total_interest = Decimal('0')
-    annuity_months = 0
-    lump_pending = lump_d > Decimal('0')
-    split = None  # (lump_date, balance_before_lump) → next payment's interest is split
-
-    # Lump made before the first upcoming payment, or with no date at all.
-    if lump_pending and (lump_date is None or lump_date <= prev_date):
-        amount = min(lump_d, balance)
-        balance -= amount
-        schedule.append(_early_row(lump_date or prev_date, amount, balance))
-        if mode == 'reduce_payment':
-            payment = _annuity(balance, n)
-        lump_pending = False
-
-    for i, date in enumerate(dates):
-        if balance <= Decimal('0.01'):
-            break
-
-        # ── Early repayment falling strictly inside the current period ──────
-        if lump_pending and lump_date is not None and prev_date < lump_date < date:
-            bal_before = balance
-            amount = min(lump_d, balance)
-            balance -= amount
-            schedule.append(_early_row(lump_date, amount, balance))
-            split = (lump_date, bal_before)
-            lump_pending = False
-            if mode == 'reduce_payment':
-                payment = _annuity(balance, n - i)
-            if balance <= Decimal('0.01'):
-                break
-
-        # ── Interest for this period ────────────────────────────────────────
-        if split is not None:
-            lump_dt, bal_before = split
-            days1 = (lump_dt - prev_date).days
-            days2 = (date - lump_dt).days
-            interest = _r2(
-                bal_before * daily_rate * _d(days1) +
-                balance    * daily_rate * _d(days2)
-            )
-            split = None
-        elif adjust_business_days:
-            interest = _r2(balance * daily_rate * _d((date - prev_date).days))
-        else:
-            interest = _r2(balance * rate)
-
-        # ── Regular annuity ─────────────────────────────────────────────────
-        if i == n - 1 or payment >= balance + interest:
-            principal = _r2(balance)
-            pay_amount = _r2(principal + interest)
-        else:
-            pay_amount = payment
-            principal = _r2(pay_amount - interest)
-            if principal < Decimal('0'):
-                principal = Decimal('0')
-
-        balance = max(balance - principal, Decimal('0'))
-        total_interest += interest
-        annuity_months += 1
-        prev_date = date
-
-        schedule.append({
-            'payment_num': 0,
-            'date': date.strftime('%d.%m.%Y'),
-            'payment': float(pay_amount),
-            'principal': float(principal),
-            'interest': float(interest),
-            'balance': float(_r2(balance)),
-            'early': 0.0,
-        })
-
-        # ── Early repayment on the payment date — strictly AFTER the annuity ─
-        if lump_pending and lump_date is not None and lump_date == date and balance > Decimal('0.01'):
-            amount = min(lump_d, balance)
-            balance -= amount
-            schedule.append(_early_row(date, amount, balance))
-            lump_pending = False
-            if mode == 'reduce_payment':
-                payment = _annuity(balance, n - i - 1)
-
-        if balance <= Decimal('0.01'):
-            break
-
-    for idx, row in enumerate(schedule):
-        row['payment_num'] = idx + 1
-
-    return schedule, float(payment), float(_r2(total_interest)), annuity_months
+    result = simulate_strategy(state, events, opts)
+    return (result.schedule, result.monthly_payment,
+            result.total_interest, result.annuity_months)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +389,8 @@ def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_p
                 'interest':    float(interest),
                 'balance':     float(_r2(balance)),
                 'early':       float(early_row1),
+                'row_kind':    ROW_ANNUITY,
+                'early_interest': 0.0,
             })
 
             if balance <= Decimal('0.01'):
@@ -496,6 +417,8 @@ def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_p
                     'interest':    0.0,
                     'balance':     float(_r2(balance)),
                     'early':       float(extra_amount),
+                    'row_kind':    ROW_EARLY,
+                    'early_interest': 0.0,
                 })
                 # Carry forward for next month's split interest calculation.
                 split_info = (extra_date, bal_before_early)
@@ -524,6 +447,8 @@ def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_p
                     'interest':    float(interest),
                     'balance':     0.0,
                     'early':       float(early_final),
+                    'row_kind':    ROW_ANNUITY,
+                    'early_interest': 0.0,
                 })
                 if lump_this_month:
                     lump_applied = True
@@ -542,6 +467,8 @@ def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_p
                 'interest':    float(interest),
                 'balance':     float(_r2(balance)),
                 'early':       0.0,
+                'row_kind':    ROW_ANNUITY,
+                'early_interest': 0.0,
             })
 
             if balance <= Decimal('0.01'):
@@ -570,6 +497,8 @@ def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_p
                     'interest':    0.0,
                     'balance':     float(_r2(balance)),
                     'early':       float(extra),
+                    'row_kind':    ROW_EARLY,
+                    'early_interest': 0.0,
                 })
 
             if balance <= Decimal('0.01'):
@@ -590,19 +519,16 @@ def run_comparison(mortgage, deposit, strategy=None):
       C  — snowball: lump_sum at lump_sum_date + monthly extra from monthly_start_date
 
     strategy fields used:
-        lump_sum, lump_sum_date, monthly_budget, monthly_start_date
-
-    The amount for both deposit and repayment is strategy.lump_sum.
+        lump_sum, lump_sum_date, monthly_budget, monthly_start_date,
+        repayment_mode, early_repayment_allocation
     """
     strategy = strategy or {}
     adj = bool(mortgage.get('adjust_business_days'))
+    basis = basis_for(adj)
 
     first_dt = _parse_date(mortgage['first_payment_date'])
     last_dt = _parse_date(mortgage['last_payment_date'])
     next_dt = first_dt + relativedelta(months=1)
-
-    scheduled_dates = list(rrule(MONTHLY, dtstart=next_dt, until=last_dt))
-    original_n = len(scheduled_dates)
 
     # Strategy parameters
     lump_sum = float(strategy.get('lump_sum') or 0)
@@ -612,29 +538,45 @@ def run_comparison(mortgage, deposit, strategy=None):
     monthly_extra_day = strategy.get('monthly_extra_day') or None
     if monthly_extra_day:
         monthly_extra_day = int(monthly_extra_day)
+    repayment_mode = strategy.get('repayment_mode') or 'reduce_payment'
+    allocation = strategy.get('early_repayment_allocation') or ALLOC_PRINCIPAL_ONLY
 
-    lump_idx = _date_to_idx(lump_sum_date, scheduled_dates)
-    monthly_idx = _date_to_idx(monthly_start_date, scheduled_dates)
+    base_state = MortgageState(
+        loan_amount=mortgage['loan_amount'],
+        annual_rate=mortgage['annual_rate'],
+        first_payment_date=next_dt,
+        last_payment_date=last_dt,
+        prev_payment_date=first_dt,
+        contract_payment=mortgage['monthly_payment'],
+    )
+    opts = SimOptions(basis=basis, allocation=allocation)
 
     # Baseline: original mortgage schedule, no changes.
-    base_schedule, monthly_payment, baseline_total_interest = build_amortization(
-        mortgage['loan_amount'],
-        mortgage['annual_rate'],
-        next_dt,
-        last_dt,
-        adjust_business_days=adj,
-        prev_payment_date=first_dt,
-        fixed_payment=mortgage['monthly_payment'],
-    )
+    baseline = simulate_strategy(base_state, [], opts)
+    base_schedule = baseline.schedule
+    monthly_payment = base_schedule[0]['payment']
+    baseline_total_interest = baseline.total_interest
 
-    repayment_mode = strategy.get('repayment_mode') or 'reduce_payment'
+    # ЕДИНСТВЕННАЯ сетка дат: та же, по которой построен график. Раньше дата
+    # вливания вклада бралась из необработанного rrule, а график шёл по датам,
+    # сдвинутым на рабочий день, — две сетки расходились на выходных.
+    payment_dates = baseline.dates
+    original_n = len(payment_dates)
+
+    # Снежок (`calc_repayment_schedule`) до Итерации 3 строит свою сетку сам и
+    # `adjust_business_days` не знает, поэтому его индексы считаются по сырым
+    # датам — иначе индекс из сдвинутой сетки указывал бы не на ту строку.
+    snowball_dates = list(rrule(MONTHLY, dtstart=next_dt, until=last_dt))
+    lump_idx = _date_to_idx(lump_sum_date, snowball_dates)
+    monthly_idx = _date_to_idx(monthly_start_date, snowball_dates)
 
     def _lump_run(amount, at_date, mode):
-        """One lump-sum repayment on the current mortgage. Never touches interest."""
+        """One lump-sum repayment on the current mortgage."""
         return simulate_lump_repayment(
             mortgage['loan_amount'], mortgage['annual_rate'], next_dt, last_dt,
             mortgage['monthly_payment'], amount, at_date, mode=mode,
             adjust_business_days=adj, prev_payment_date=first_dt,
+            allocation=allocation,
         )
 
     # --- Strategy A: keep lump_sum on deposit for T months, then repay ---
@@ -658,7 +600,8 @@ def run_comparison(mortgage, deposit, strategy=None):
         balance_after_deposit = base_schedule[term_months - 1]['balance'] if term_months > 0 else mortgage['loan_amount']
 
         # Money becomes available right after the payment that closes the deposit term.
-        deposit_lump_date = scheduled_dates[term_months - 1] if term_months > 0 else None
+        # Дата берётся из сетки движка, а не из сырого rrule.
+        deposit_lump_date = payment_dates[term_months - 1] if term_months > 0 else None
         deposit_schedule, deposit_new_monthly, interest_A, _ = _lump_run(
             deposit_final, deposit_lump_date, repayment_mode,
         )
@@ -761,6 +704,7 @@ def run_comparison(mortgage, deposit, strategy=None):
         'baseline_total_interest': baseline_total_interest,
         'monthly_payment': monthly_payment,
         'entered_monthly_payment': mortgage['monthly_payment'],
+        'early_repayment_allocation': allocation,
         'base_schedule': base_schedule,
         'balance_after_deposit': balance_after_deposit,
         # Full schedules (popped by the route, never stored in the DB)

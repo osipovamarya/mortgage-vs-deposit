@@ -63,7 +63,10 @@ from app.calculator import (  # noqa: E402
 )
 
 # Порядок полей строки графика. Менять нельзя, не переснимая все голдены.
-ROW_COLUMNS = ('payment_num', 'date', 'payment', 'principal', 'interest', 'balance', 'early')
+# `row_kind` и `early_interest` добавлены на Итерации 2 (W5): вид строки теперь
+# приходит из движка, а не угадывается фронтом по `interest == 0`.
+ROW_COLUMNS = ('payment_num', 'date', 'payment', 'principal', 'interest', 'balance', 'early',
+               'row_kind', 'early_interest')
 
 DEFAULT_DIFF_LIMIT = 10
 

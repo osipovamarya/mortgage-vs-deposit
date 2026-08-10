@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS repayment_strategy (
     monthly_start_date  TEXT,     -- дата начала ежемесячных погашений (ISO)
     monthly_extra_day   INTEGER,  -- день месяца для досрочного платежа (напр. 15 = день зарплаты)
     repayment_mode      TEXT NOT NULL DEFAULT 'reduce_payment',  -- 'reduce_payment' или 'reduce_term'
+    -- 'principal_only' — вся сумма досрочки идёт в тело (инвариант, дефолт не менялся)
+    -- 'interest_first' — сначала гасятся проценты периода, остаток идёт в тело
+    early_repayment_allocation TEXT NOT NULL DEFAULT 'principal_only',
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -81,13 +84,17 @@ def _schema_is_current(conn):
         return False
 
 
-# Columns added after the initial schema. Applied with ALTER TABLE so that
-# saved comparisons survive the upgrade.
+# Колонки, добавленные после первоначальной схемы. Применяются через ALTER TABLE,
+# чтобы сохранённые сравнения пережили обновление.
 _ADDED_COLUMNS = {
     'comparison': {
         'reduce_term_interest_saved':   'REAL',
         'reduce_term_months_saved':     'INTEGER',
         'reduce_term_months_to_payoff': 'INTEGER',
+    },
+    'repayment_strategy': {
+        # W5 (И2): правило распределения досрочного платежа
+        'early_repayment_allocation': "TEXT NOT NULL DEFAULT 'principal_only'",
     },
 }
 

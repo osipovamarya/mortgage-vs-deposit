@@ -98,6 +98,12 @@ function clearError(elementId) {
   el.classList.add('hidden');
 }
 
+/** Выбранное правило распределения досрочки; по умолчанию — «целиком в тело». */
+function allocationValue() {
+  const el = document.querySelector('input[name="early_repayment_allocation"]:checked');
+  return el ? el.value : 'principal_only';
+}
+
 // ── Step navigation ───────────────────────────────────────────
 
 function goToStep(n) {
@@ -137,6 +143,7 @@ document.getElementById('form-mortgage').addEventListener('submit', async (e) =>
     monthly_start_date:   document.getElementById('monthly_start_date').value || null,
     monthly_extra_day:    document.getElementById('monthly_extra_day').value || null,
     repayment_mode:       document.querySelector('input[name="repayment_mode"]:checked').value,
+    early_repayment_allocation: allocationValue(),
   };
 
   // Validate lump_sum_date: must be strictly after last actual payment (first_payment_date)
@@ -725,15 +732,28 @@ function renderScheduleTable(tab, schedules) {
     const paymentCell = isFirst
       ? `${rub(r.payment)} <small class="fact-payment">(факт: ${rub(entered)})</small>`
       : rub(r.payment);
-    const isEarly = r.early && r.early > 0.5;
-    const earlyLabel = (isEarly && r.interest === 0)
-      ? 'досрочно'
-      : `+${rub(r.early)} досрочно`;
-    const principalCell = isEarly
+    // В строке есть досрочная часть — её показываем бейджем при основном долге.
+    const hasEarly = r.early && r.early > 0.5;
+    // Отдельная строка досрочки: движок отдаёт row_kind, старый ответ — нет,
+    // тогда откатываемся на прежнюю эвристику «досрочка без процентов».
+    const isEarlyRow = typeof r.row_kind === 'string'
+      ? r.row_kind === 'early'
+      : (hasEarly && r.interest === 0);
+    // В режиме interest_first часть досрочки ушла в проценты периода.
+    const earlyInterest = r.early_interest || 0;
+    let earlyLabel;
+    if (isEarlyRow) {
+      earlyLabel = earlyInterest > 0.5
+        ? `досрочно (проценты ${rub(earlyInterest)})`
+        : 'досрочно';
+    } else {
+      earlyLabel = `+${rub(r.early)} досрочно`;
+    }
+    const principalCell = hasEarly
       ? `${rub(r.principal)} <span class="early-badge">${earlyLabel}</span>`
       : rub(r.principal);
     return `
-    <tr${isEarly ? ' class="row-early"' : ''}>
+    <tr${hasEarly ? ' class="row-early"' : ''}>
       <td>${r.payment_num}</td>
       <td>${r.date}</td>
       <td>${paymentCell}</td>

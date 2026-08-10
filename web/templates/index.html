@@ -99,6 +99,21 @@
           </div>
         </div>
 
+        <div class="form-group form-group--center">
+          <span class="radio-group-label">Банк списывает досрочный платёж:</span>
+          <div class="radio-group">
+            <label class="radio-label">
+              <input type="radio" name="early_repayment_allocation" value="principal_only" checked>
+              <span>Целиком в тело долга</span>
+            </label>
+            <label class="radio-label">
+              <input type="radio" name="early_repayment_allocation" value="interest_first">
+              <span>Сначала проценты, остаток в тело</span>
+            </label>
+          </div>
+          <small>Зависит от банка и договора; если досрочка вносится строго в дату планового платежа — разницы нет.</small>
+        </div>
+
         <div class="form-row">
           <div class="form-group">
             <label for="lump_sum">Разовое погашение (₽)</label>

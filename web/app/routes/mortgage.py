@@ -6,6 +6,11 @@ from ..calculator import build_amortization
 
 mortgage_bp = Blueprint('mortgage', __name__, url_prefix='/api/mortgage')
 
+# Правило распределения досрочного платежа (W5).
+# 'principal_only' — вся сумма в тело долга (инвариант, дефолт не менялся);
+# 'interest_first' — сначала гасятся проценты периода, остаток идёт в тело.
+ALLOWED_ALLOCATIONS = ('principal_only', 'interest_first')
+
 
 @mortgage_bp.route('', methods=['POST'])
 def create_mortgage():
@@ -57,6 +62,14 @@ def create_mortgage():
     monthly_extra_day = int(data['monthly_extra_day']) if data.get('monthly_extra_day') else None
     repayment_mode = data.get('repayment_mode', 'reduce_payment')
 
+    # Поле необязательное: его отсутствие (или пустая строка) — это 'principal_only'.
+    early_repayment_allocation = data.get('early_repayment_allocation') or 'principal_only'
+    if early_repayment_allocation not in ALLOWED_ALLOCATIONS:
+        return jsonify({
+            'error': 'Неизвестное правило распределения досрочки: '
+                     f'{early_repayment_allocation} (ожидается одно из {", ".join(ALLOWED_ALLOCATIONS)})'
+        }), 400
+
     db = get_db()
     cursor = db.execute(
         """INSERT INTO mortgage (name, loan_amount, annual_rate, first_payment_date, last_payment_date, monthly_payment, adjust_business_days)
@@ -75,9 +88,11 @@ def create_mortgage():
 
     strategy_cursor = db.execute(
         """INSERT INTO repayment_strategy
-           (mortgage_id, lump_sum, lump_sum_date, monthly_budget, monthly_start_date, monthly_extra_day, repayment_mode)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (mortgage_id, lump_sum, lump_sum_date, monthly_budget, monthly_start_date, monthly_extra_day, repayment_mode),
+           (mortgage_id, lump_sum, lump_sum_date, monthly_budget, monthly_start_date, monthly_extra_day,
+            repayment_mode, early_repayment_allocation)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mortgage_id, lump_sum, lump_sum_date, monthly_budget, monthly_start_date, monthly_extra_day,
+         repayment_mode, early_repayment_allocation),
     )
     db.commit()
 
