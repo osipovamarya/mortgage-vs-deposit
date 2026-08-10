@@ -24,10 +24,14 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
-app/__pycache__
-app/utils/__pycache__
 
+# SQLite: временные файлы рядом с базой. Сами базы в db/ версионируются,
+# журналы и WAL — нет, иначе они попадают в коммит после каждого запуска.
+*.db-journal
+*.db-wal
+*.db-shm
 
-# IDE
+# IDE / инструменты
 .idea/
 .vscode/
+.claude/settings.local.json

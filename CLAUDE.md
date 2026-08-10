@@ -8,47 +8,72 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A locally-run web application that answers one question: **is it more profitable to put your savings on a deposit account, or use them for a partial mortgage repayment?**
 
-The app walks the user through two forms (mortgage → deposit), then shows a side-by-side comparison of both strategies with a clear winner.
+The app takes one form (mortgage + repayment strategy + deposit terms), then shows the strategies side by side with a clear winner.
+
+Working language of the repo is Russian: docstrings, comments, UI strings, `CHANGELOG.md` and `ROADMAP.md` are written in Russian. This file stays in English — it is the agent-facing contract.
 
 ---
 
 ## Repository Layout
 
 ```
-mortgage_calc/
+mortgage-vs-deposit/
 ├── tgapp_legacy/                 # Original Telegram bot (legacy, do not modify)
 │   ├── bot.py
-│   ├── mortgage.py               # ← Reused by the web app for calculations
+│   ├── mortgage.py
 │   ├── mortgage_registry.py
 │   ├── mortgage_count.py
 │   ├── telegram_user.py
 │   ├── Dockerfile
 │   └── requirements.txt
-├── web/                          # New Flask web application (active)
+├── web/                          # Flask web application (active)
 │   ├── app/
 │   │   ├── __init__.py
 │   │   ├── main.py               # Flask app factory + entry point
-│   │   ├── database.py           # SQLite connection, schema migrations
-│   │   ├── engine.py             # Событийный движок графика платежей (И1)
-│   │   ├── calculator.py         # Deposit + comparison calculation logic
+│   │   ├── database.py           # SQLite connection, schema, additive migrations
+│   │   ├── engine.py             # Event-driven payment-schedule engine (the only loop)
+│   │   ├── calculator.py         # Thin wrappers over the engine + deposit + comparison
 │   │   └── routes/
 │   │       ├── __init__.py
-│   │       ├── mortgage.py       # /api/mortgage endpoints
-│   │       ├── deposit.py        # /api/deposit endpoints
-│   │       └── comparison.py     # /api/comparison endpoints
+│   │       ├── mortgage.py       # /api/mortgage — mortgage + repayment_strategy
+│   │       ├── deposit.py        # /api/deposit
+│   │       └── comparison.py     # /api/comparison
 │   ├── static/
-│   │   ├── css/
-│   │   │   └── style.css         # Modern clean design
-│   │   └── js/
-│   │       └── app.js            # Step-by-step form logic + result rendering
-│   └── templates/
-│       └── index.html            # Single-page app shell
+│   │   ├── css/style.css
+│   │   ├── js/app.js             # Form logic + result rendering
+│   │   └── favicon.ico, favicon-32.png
+│   └── templates/index.html      # Single-page app shell
+├── tests/                        # stdlib unittest (no pytest, never add one)
+│   ├── matrix.py                 # Single source of input cases for snapshot AND tests
+│   ├── test_golden.py            # Schedules vs committed golden files
+│   ├── test_invariant.py         # Unconditional invariants over the whole matrix
+│   ├── test_engine.py            # engine.py contracts
+│   ├── test_snowball.py          # calc_repayment_schedule / simulate_snowball
+│   ├── test_cash_parity.py       # cash-flow parity contract (decision 7)
+│   ├── test_early_repayment_allocation.py   # principal_only vs interest_first (W5)
+│   ├── test_migration.py         # schema migrations keep saved history
+│   ├── test_regressions.py       # one class per code-review finding, with the input it broke on
+│   └── golden/
+│       ├── build_amortization.json          #    92 cases
+│       ├── simulate_lump_repayment.json     #  2964 cases
+│       ├── calc_repayment_schedule.json     #  2205 cases
+│       ├── known_bugs.json                  # registry of accepted defects (currently 0)
+│       └── comparison_before_v4.json        # snapshot of 5 saved comparisons (for И5)
+├── scripts/
+│   ├── snapshot_golden.py        # take / check golden snapshots
+│   ├── snapshot_comparison.py    # read-only snapshot of saved comparisons via the API
+│   └── bench_engine.py           # cost of one simulate_strategy run
 ├── db/
 │   ├── morst_bot.db              # Legacy Telegram bot database
-│   └── mortgage_web.db           # Web app database (created on first run)
-├── Dockerfile                    # Web app Docker image (build context: repo root)
+│   ├── morst_bot_old.db          # Legacy backup
+│   └── mortgage_web.db           # Web app database — LIVE USER HISTORY, never edit
+├── Dockerfile                    # Web app image (build context: repo root)
 ├── docker-compose.yml
-├── requirements.txt              # Web app dependencies (Flask, python-dateutil)
+├── requirements.txt              # Flask, python-dateutil
+├── run.sh                        # legacy bot script, hard-coded foreign path — do not run
+├── README.md                     # human-facing: how to run, how to test
+├── ROADMAP.md                    # plan: iterations И0–И9, decisions, open questions
+├── CHANGELOG.md                  # what changed and why, with measured numbers
 └── CLAUDE.md
 ```
 
@@ -58,7 +83,7 @@ mortgage_calc/
 
 **With Docker (recommended):**
 ```bash
-cd /path/to/mortgage_calc
+cd /path/to/mortgage-vs-deposit
 docker compose up --build
 ```
 Then open http://localhost:5000
@@ -80,114 +105,191 @@ DB_PATH=../db/mortgage_web.db PYTHONPATH=.. flask --app app/main.py run
 
 **Important:** always run Flask from the `web/` directory so Python's import resolution finds `web/app/` as the `app` package.
 
+**`db/mortgage_web.db` holds the user's real history.** Never start the app against it while
+experimenting, never write to it from a script. Copy it to a scratch directory and point
+`DB_PATH` at the copy. `scripts/snapshot_comparison.py` is the model to follow: it opens the
+original as `file:...?mode=ro` and serves the app from a copy.
+
+---
+
+## Tests and the Golden Snapshot
+
+There is no pytest in the environment and none is to be added — stdlib `unittest` only.
+
+```bash
+# whole suite (~25 s; 137 tests at the time of writing, the set keeps growing)
+cd /path/to/mortgage-vs-deposit
+PYTHONPATH=web .venv/bin/python -m unittest discover -s tests
+
+# calculations vs the committed golden snapshot; writes nothing, exit code 1 on any drift
+PYTHONPATH=web:tests .venv/bin/python scripts/snapshot_golden.py --check
+
+# what is snapshotted and how big it is
+PYTHONPATH=web:tests .venv/bin/python scripts/snapshot_golden.py --list
+```
+
+The snapshot stores **full schedules row by row** (`ROW_KEYS` order), not just totals, over the
+matrix in `tests/matrix.py`: balance × rate × lump sum × lump date × mode × business-day shift ×
+monthly budget × extra-payment day × day-of-month of the first payment.
+
+**Re-snapshotting rule.** `--accept` takes exactly one function and requires `--reason`; the
+reason is appended to `CHANGELOG.md` automatically.
+
+```bash
+PYTHONPATH=web:tests .venv/bin/python scripts/snapshot_golden.py \
+    --accept simulate_lump_repayment --reason "why the numbers changed"
+```
+
+There is deliberately **no command that rewrites every golden at once**: "run the script and
+commit" must stay an impossible move, otherwise the snapshot proves nothing. `--init` only works
+when no golden exists at all.
+
+`tests/golden/known_bugs.json` is the registry of defects recorded as-is so that they neither
+break the build nor get lost. It is currently **empty and must stay empty** — the underpayment
+bug it used to hold (262 cases) was fixed in И3.
+
+Definition of done for any change here: the whole suite green **and** `--check` reporting 0 diffs,
+or an explicit `--accept` with a reason.
+
 ---
 
 ## Architecture
 
 **Backend:** Python + Flask (intentionally simple — no async, no ORM, plain sqlite3).
 
-**Frontend:** Single HTML page with vanilla JS. No build step, no framework. Step-by-step form wizard rendered client-side; results section shown/hidden by JS. Charts via Chart.js (CDN).
+**Frontend:** Single HTML page with vanilla JS. No build step, no framework. All inputs on one
+form; results section shown/hidden by JS. Charts via Chart.js (CDN).
 
 **Database:** SQLite. Single-user, no authentication. All records belong to one local user.
 
-**Calculation logic:**
-- Mortgage annuity payment and schedule: reused from `tgapp_legacy/mortgage.py`
-- Mortgage schedule and early repayment: `web/app/engine.py` (событийный движок)
-- Deposit compound interest: implemented in `web/app/calculator.py`
-- Comparison logic: implemented in `web/app/calculator.py`
+**Calculation layer:**
+
+| Module | Role |
+|---|---|
+| `web/app/engine.py` | `simulate_strategy(state, events, opts)` — **the only** month-by-month loop in the project |
+| `web/app/calculator.py` | thin wrappers over the engine, deposit math, `run_comparison()` |
+| `tgapp_legacy/mortgage.py` | legacy annuity code, **no longer imported** by the web app |
 
 ---
 
 ## User Flow
 
-### Step 1 — Mortgage parameters
-User enters their **current** mortgage state (not the original loan — what they have *now*):
-- Remaining principal balance (сколько ещё долга)
+### Step 1 — one form
+**Mortgage** (current state, not the original loan):
+- Remaining principal balance
 - Annual interest rate (%)
-- First upcoming payment date (DD.MM.YYYY)
-- Last payment date (DD.MM.YYYY) — determines remaining term
-- Monthly payment — auto-calculated from the above, but user can override
+- Amount and date of the **last payment already made** (`monthly_payment`, `first_payment_date`) — the schedule starts one month later
+- Contract end date (`last_payment_date`)
+- «Переносить платёж на следующий рабочий день» (`adjust_business_days`) — also selects the interest basis, see below
 
-### Step 2 — Deposit / Savings parameters
-User enters what they want to do with their savings:
-- Amount (сумма накоплений, the money to invest or repay with)
-- Annual deposit rate (%)
-- Term in months (how long to keep it on deposit)
-- Capitalization: yes/no (monthly compound interest or simple interest)
+**Repayment strategy:**
+- `repayment_mode`: reduce payment / reduce term
+- `early_repayment_allocation`: principal only / interest first
+- `lump_sum` + `lump_sum_date` — the savings, and when they go into the mortgage
+- `monthly_budget` + `monthly_start_date` + `monthly_extra_day` — snowball ("what I am ready to pay per month in total")
 
-### Step 3 — Comparison results
-Three scenarios shown as cards:
+**Deposit:** annual rate, term in months, capitalization yes/no. The **amount is not asked** —
+the money on the deposit is the same `lump_sum`, otherwise the strategies would not be comparable.
 
-| Scenario | What it shows |
+### Step 2 — results
+Cards (a card is hidden when its scenario is not applicable to the input):
+
+| Card | What it shows |
 |---|---|
-| **Deposit** | Total interest earned after the deposit term |
-| **Repay → Reduce term** | How many months shorter, how much total interest saved |
-| **Repay → Reduce payment** | New monthly payment, how much total interest saved |
+| **Параметры расчёта** | echo of the inputs plus the comparison family (`baseline_kind`) and why it was chosen |
+| **Вклад → потом погасить** | deposit income over the term, then the whole `deposit_final` goes into the mortgage |
+| **Досрочно погасить → уменьшить платёж** | new monthly payment, interest saved |
+| **Досрочно погасить → уменьшить срок** | new payoff date, months saved, interest saved |
+| **Снежный ком** | monthly extra payments, payoff month, interest saved (only when `monthly_budget` is set) |
+| **Вклад вместо досрочек** | the same money accumulated on a deposit instead, and the month it overtakes the debt |
 
-A highlighted banner shows the winner (deposit income vs best repayment interest saved).
-
-Below the cards: a toggle for a monthly payment schedule table for each scenario.
+A highlighted banner shows the winner. Below: two Chart.js charts (remaining balance per scenario,
+gain per scenario) and a per-scenario payment-schedule table.
 
 ---
 
 ## Database Schema
 
-File: `db/mortgage_web.db`
+File: `db/mortgage_web.db`. This is the actual schema, taken from the live database.
 
 ```sql
 CREATE TABLE mortgage (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                 TEXT NOT NULL DEFAULT 'Моя ипотека',
+    loan_amount          REAL NOT NULL,      -- remaining principal balance
+    annual_rate          REAL NOT NULL,      -- interest rate % per year
+    first_payment_date   TEXT NOT NULL,      -- ISO date of the LAST payment already made
+    last_payment_date    TEXT NOT NULL,      -- ISO date, contract end
+    monthly_payment      REAL,               -- contract payment, entered by the user
+    adjust_business_days INTEGER DEFAULT 0,  -- 1 → shift to next business day AND daily basis
+    created_at           DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE repayment_strategy (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    name                TEXT NOT NULL DEFAULT 'My Mortgage',
-    loan_amount         REAL NOT NULL,      -- remaining principal balance
-    annual_rate         REAL NOT NULL,      -- interest rate % per year
-    first_payment_date  DATE NOT NULL,      -- ISO date string
-    last_payment_date   DATE NOT NULL,      -- ISO date string
-    monthly_payment     REAL,               -- calculated; can be overridden
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    mortgage_id         INTEGER NOT NULL REFERENCES mortgage(id),
+    lump_sum            REAL,     -- one-off early repayment amount
+    lump_sum_date       TEXT,     -- ISO date of the one-off repayment
+    monthly_budget      REAL,     -- total monthly budget (snowball)
+    monthly_start_date  TEXT,     -- ISO date the monthly extra starts
+    monthly_extra_day   INTEGER,  -- day of month for the extra payment (e.g. payday)
+    repayment_mode      TEXT NOT NULL DEFAULT 'reduce_payment',  -- 'reduce_payment' | 'reduce_term'
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    early_repayment_allocation TEXT NOT NULL DEFAULT 'principal_only'
+                                            -- 'principal_only' | 'interest_first'
 );
 
 CREATE TABLE deposit (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT NOT NULL DEFAULT 'My Deposit',
-    amount          REAL NOT NULL,          -- the savings amount
-    annual_rate     REAL NOT NULL,          -- deposit rate % per year
-    term_months     INTEGER NOT NULL,       -- deposit duration
+    name            TEXT NOT NULL DEFAULT 'Мой вклад',
+    annual_rate     REAL NOT NULL,
+    term_months     INTEGER NOT NULL,
     capitalization  INTEGER DEFAULT 1,      -- 1 = compound monthly, 0 = simple
-    start_date      DATE NOT NULL,          -- ISO date string
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+-- No `amount` column: the deposit amount is repayment_strategy.lump_sum.
 
 CREATE TABLE comparison (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    mortgage_id         INTEGER NOT NULL,
-    deposit_id          INTEGER NOT NULL,
+    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repayment_strategy_id           INTEGER NOT NULL REFERENCES repayment_strategy(id),
+    deposit_id                      INTEGER NOT NULL REFERENCES deposit(id),
 
-    -- Scenario A: keep savings on deposit
-    deposit_income      REAL,               -- interest earned from deposit
-    deposit_final       REAL,               -- total amount (principal + income)
+    -- Strategy A: deposit the lump sum for T months, then repay
+    deposit_income                  REAL,
+    deposit_final                   REAL,
+    deposit_net_saving              REAL,
+    deposit_new_monthly             REAL,
 
-    -- Scenario B1: partial repayment → reduce term
-    reduce_term_new_last_date   DATE,       -- new end date
-    reduce_term_months_saved    INTEGER,    -- months cut off
-    reduce_term_interest_saved  REAL,       -- total interest saved vs baseline
+    -- Strategy B1: lump-sum early repayment → reduce payment
+    reduce_payment_new_monthly      REAL,
+    reduce_payment_interest_saved   REAL,
 
-    -- Scenario B2: partial repayment → reduce payment
-    reduce_payment_new_monthly  REAL,       -- new monthly payment
-    reduce_payment_interest_saved REAL,     -- total interest saved vs baseline
+    -- Strategy B2: lump-sum early repayment → reduce term
+    reduce_term_interest_saved      REAL,
+    reduce_term_months_saved        INTEGER,
+    reduce_term_months_to_payoff    INTEGER,
 
-    -- Baseline: total interest with no changes
-    baseline_total_interest     REAL,
+    -- Strategy C: snowball
+    snowball_total_interest         REAL,
+    snowball_interest_saved         REAL,
+    snowball_months_to_payoff       INTEGER,
+    snowball_deposit_income         REAL,
+    snowball_deposit_final          REAL,
 
-    -- Summary
-    winner              TEXT,               -- 'deposit', 'reduce_term', or 'reduce_payment'
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (mortgage_id) REFERENCES mortgage(id),
-    FOREIGN KEY (deposit_id)  REFERENCES deposit(id)
+    baseline_total_interest         REAL,
+    winner                          TEXT,   -- 'deposit' | 'reduce_payment' | 'reduce_term' | 'snowball'
+    created_at                      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
-Dates stored as ISO strings (`YYYY-MM-DD`). User-facing input/display uses `DD.MM.YYYY`.
+Dates are stored as ISO strings (`YYYY-MM-DD`); user-facing input/display uses `DD.MM.YYYY`.
+Schedules are **never** stored — they are recomputed and returned by the API.
+
+**Migrations.** `database.py` keeps two mechanisms: `_schema_is_current()` decides whether the
+whole schema is stale (drop + recreate), and `_ADDED_COLUMNS` adds new columns via `ALTER TABLE`
+so saved comparisons survive an update. Anything additive goes into `_ADDED_COLUMNS` —
+never into the drop path. (Iteration И5 of the roadmap replaces both with `PRAGMA user_version`
+plus a single, one-time reset; do not pre-empt it.)
 
 ---
 
@@ -196,30 +298,107 @@ Dates stored as ISO strings (`YYYY-MM-DD`). User-facing input/display uses `DD.M
 All return JSON.
 
 ```
-POST   /api/mortgage              Save mortgage, return {id, monthly_payment, schedule_preview}
-GET    /api/mortgage/<id>         Get mortgage by id
-GET    /api/mortgage              List all mortgages (history)
+POST   /api/mortgage      mortgage + repayment strategy in one payload →
+                          {id, strategy_id, monthly_payment, total_interest, payment_count}
+GET    /api/mortgage/<id> Get mortgage by id
+GET    /api/mortgage      List all mortgages (history)
 
-POST   /api/deposit               Save deposit params, return {id, deposit_income, deposit_final}
-GET    /api/deposit/<id>          Get deposit by id
+POST   /api/deposit       {annual_rate, term_months, capitalization} → {id}
+GET    /api/deposit/<id>  Get deposit by id
 
-POST   /api/comparison            {mortgage_id, deposit_id} → calculate + save, return full results
-GET    /api/comparison/<id>       Get comparison results with schedules
-GET    /api/comparison            List all comparisons (history)
+POST   /api/comparison    {strategy_id, deposit_id} → calculate + save, return full results
+                          incl. `schedules` per scenario, `own_cost`, `cash_parity`, `winner`,
+                          `option_statuses`, `options_applicable`
+GET    /api/comparison/<id>   Saved scalar results (no schedules)
+GET    /api/comparison        List all comparisons (history)
 ```
+
+`POST /api/mortgage` validates the input before saving: required fields (`0` is a legal value,
+only `None`/`''` are missing), date format `DD.MM.YYYY`, `last > first`, at least one month
+between them (otherwise the payment grid is empty), positive balance and payment, non-negative
+rate, and `early_repayment_allocation` from the allowed set. Everything else returns 400 with a
+readable Russian message.
+
+`POST /api/comparison` returns `schedules.{baseline,deposit,reduce_payment,reduce_term[,snowball]}`.
+Every schedule is prefixed with one static row for the last payment already made, so row 1 always
+shows the balance the user entered.
 
 ---
 
-## Calculation Logic (web/app/engine.py + web/app/calculator.py)
+## Calculation Logic
 
-### Mortgage (reused from app/mortgage.py)
-Annuity payment formula:
-```
-M = P * (r / (1 - (1 + r)^-n))
-```
-Where: `P` = principal, `r` = monthly rate (annual_rate / 12 / 100), `n` = number of payments.
+### The engine — `web/app/engine.py`
 
-The full payment schedule (principal + interest split per month) is generated month by month.
+`simulate_strategy(state, events, opts) -> StrategyResult` is the single entry point and the only
+month-by-month loop. Everything else is a wrapper:
+
+| Wrapper (`calculator.py`) | Events passed to the engine |
+|---|---|
+| `build_amortization()` | `[]` — a plain annuity schedule |
+| `simulate_lump_repayment()` | one `RepaymentEvent(kind='lump')` |
+| `simulate_snowball()` / `calc_repayment_schedule()` | one `kind='recurring'` budget event (+ optional lump) |
+
+Contracts: `MortgageState` (balance, rate, first/last payment dates, accrual anchor, contract
+payment), `RepaymentEvent` (amount, date, `kind`, `mode`, `allocation`, `amount_kind`, plus the
+recurring fields `start_date` / `end_date` / `day_of_month` / `period_months` / `phase`),
+`SimOptions` (`basis`, `allocation`), `StrategyResult` (schedule, `total_interest`,
+`monthly_payment`, `annuity_months`, `months_to_payoff`, `dates`, `lump_unused`, `status`).
+
+**Interest is accrued over a list of segments**, not by three special cases. The period between
+two scheduled payments is cut by events into `(start, end, balance)` segments, and the period's
+interest is computed from that list. This is what makes the early-repayment invariant structural:
+an event only closes the current accrual segment and opens the next one.
+
+**The accrual basis is fixed once per comparison** and comes **only** from `adjust_business_days`
+(`basis_for()`):
+
+- `BASIS_MONTHLY` — the period costs exactly `balance * annual/12` no matter how many days it has;
+  when an event splits it, that same amount is distributed between the segments pro rata by days;
+- `BASIS_DAILY` — `balance * annual/365 * actual days`.
+
+Mixing bases is forbidden (a daily balance multiplied by a monthly rate is exactly the bug that
+produced the wrong 8 366.21 in the roadmap). `monthly_extra_day` does **not** switch the basis.
+
+**One date grid.** `payment_grid()` is the only source of payment dates: the schedule, the
+snowball indices and the date the deposit is poured into the mortgage all come from it. Two grids
+(raw `rrule` vs business-day-shifted) is a bug class of its own.
+
+Each schedule row carries `row_kind` (`'annuity' | 'early'`) and `early_interest`. **The frontend
+must branch on `row_kind`, never guess from `interest == 0` or from `early > 0`** — in
+`interest_first` an early row can legitimately have `early == 0` with all of the money going into
+interest.
+
+A zero annual rate is a legal, degenerate input (interest-free instalments): the annuity formula
+divides by `factor − 1`, so `_annuity()` handles it in a separate branch — principal split evenly
+over the remaining periods.
+
+Known and deliberately kept: `rrule(MONTHLY)` skips short months, so with a payment day of 30 or
+31 February drops out of the grid and one row covers 59 days. Recorded in the golden snapshot as-is.
+
+### Early repayment: an invariant that became the default
+
+**`early_repayment_allocation` is a user setting; `principal_only` is the default and it is the
+invariant.**
+
+`principal_only` — the early repayment goes 100% into the principal and never pays interest.
+Interest already accrued for the running period is charged in full on the pre-event balance and
+is presented by the next annuity. The early row has `interest = 0` and `early_interest = 0`.
+Fixed by commit `3ca4b3e`, guarded by `tests/test_invariant.py`. Do not weaken it.
+
+`interest_first` — interest accrued from the previous payment up to the repayment date is
+withheld from the payment first, the remainder goes into the principal. The segment cursor moves
+to the event date, so the next annuity charges interest only for the remaining days — no double
+accrual. If the payment is smaller than the accrued interest, only what was paid is withheld, the
+principal does not decrease, and the uncovered remainder (`carried_interest`) is added to the next
+annuity's interest.
+
+Three application points; in the first two the two allocations are **identical**:
+
+- lump **before** the first upcoming payment (or with no date) → applied at once, there is no
+  accrued period yet;
+- lump **on** a payment date → applied *after* that date's annuity, so that payment's interest
+  equals the baseline one;
+- lump **between** payments → the period is split into segments; only here do the modes diverge.
 
 ### Deposit
 With capitalization (compound monthly):
@@ -232,60 +411,49 @@ Without capitalization (simple interest):
 income = P * (annual_rate/100) * (term_months/12)
 ```
 
-### Partial Repayment
+### The freed payment earns nothing: `REINVEST_EARNING_MONTHS = 0`
 
-Считается событийным движком `web/app/engine.py`. `simulate_lump_repayment()` —
-тонкая обёртка над ним и единственная точка входа для всех сценариев с разовой
-суммой (вклад → погасить, уменьшить платёж, уменьшить срок); она же даёт и итоги,
-и графики, которые видит пользователь.
+In `reduce_payment` the borrower stops paying `contract_payment − new_monthly` every month. That
+money is accounted for as *not spent* (cash parity), but it **earns no income**:
+`calc_reinvest_income()` is called with `earning_months = REINVEST_EARNING_MONTHS = 0`.
 
-**Правило распределения досрочки выбирается пользователем (`early_repayment_allocation`),
-дефолт — `principal_only`.**
+The reason is the products, not caution: deposits start at 50 000 ₽ and cannot be topped up, while
+a few thousand roubles a month is what gets freed — there is nowhere to put it. Only the **one-off
+sum** goes on a deposit, because it is already there. The monthly budget surplus has no
+alternative either: it goes into the mortgage or it sits idle.
 
-`principal_only` — **инвариант, действующий по умолчанию: досрочка идёт на 100 % в тело
-долга и никогда не оплачивает проценты.** Проценты, уже начисленные за текущий период,
-предъявляются полностью и считаются от остатка ДО досрочки. Строка досрочки в графике
-имеет `interest = 0`. Инвариант зафиксирован коммитом `3ca4b3e` и держится структурно:
-событие только закрывает текущий сегмент начисления и открывает следующий.
+The measurement that killed the previous rule (roadmap decision 16, cancelled; decision 17 is the
+replacement): mortgage 2 983 243 ₽ at 7.99% over 294 months, deposit 16%, 2 635 ₽/month freed →
+`reinvest_income` = 8 739 709 ₽ on a three-million loan, `own_cost` going negative
+(−5 322 774 ₽), and `reduce_payment` winning because of an assumption about deposit rates
+twenty-five years out.
 
-`interest_first` — из досрочки сначала удерживаются проценты, начисленные с прошлого
-платежа по дату досрочки, остаток идёт в тело. Курсор сегмента сдвигается на дату
-досрочки, поэтому ближайший аннуитет начисляет проценты только за оставшиеся дни —
-двойного начисления нет. Если досрочка меньше начисленных процентов, проценты
-удерживаются в пределах внесённой суммы, тело не уменьшается, а непокрытый остаток
-(`carried_interest`) прибавляется к процентам ближайшего аннуитета.
+### Comparison metric — `run_comparison()`
 
-Три точки применения (в первых двух режимы **тождественны**):
-
-- lump **before** the first upcoming payment (or with no date) → applied at once;
-  накопленного периода ещё нет;
-- lump **on** a payment date → applied *after* that date's annuity, so that payment's
-  interest equals the baseline one; проценты периода уже закрыты аннуитетом;
-- lump **between** payments → период делится на отрезки; здесь режимы расходятся.
-
-База начисления фиксируется один раз на весь расчёт и берётся только из
-`adjust_business_days`: `monthly` (период стоит `balance * rate/12`, при дроблении эта же
-сумма распределяется между отрезками пропорционально дням) или `daily`
-(`balance * rate/365 * дни`). Смешивать базы нельзя.
-
-Каждая строка графика несёт `row_kind` (`'annuity' | 'early'`) и `early_interest` — вид
-строки приходит из движка, а не угадывается фронтом по `interest == 0`.
-
-`calc_repayment_schedule()` (snowball) — пока отдельная реализация (переезжает на движок
-на Итерации 3), но следует тому же правилу: строки доплаты всегда несут `interest = 0`.
-
-After applying `deposit.amount` as a lump-sum payment to the remaining principal:
-
-**Reduce term:** recalculate `n` keeping monthly payment the same → new `last_payment_date`.
-
-**Reduce payment:** recalculate `M` keeping `n` the same → new smaller monthly payment.
-
-In both cases, compare total interest paid (sum of interest portions across all payments) against the baseline schedule to get `interest_saved`.
-
-### Comparison winner
 ```
-winner = argmax(deposit_income, reduce_term_interest_saved, reduce_payment_interest_saved)
+own_cost        = total_interest − deposit_income − reinvest_income
+interest_saved  = own_cost(baseline) − own_cost(scenario)
+winner          = argmax(interest_saved) over APPLICABLE scenarios only
 ```
+
+`status = 'not_applicable'` means exactly one thing: **not a single event was applied**, so the
+scenario's schedule is byte-identical to the baseline (e.g. the lump date is past the end of the
+schedule). Such a scenario is excluded from the contest — its saving is exactly 0.00 ₽, which
+beats any negative one, so "did nothing" would win (roadmap decision 6). An unspent lump on its
+own does **not** set the status: in the snowball the loan can close before the lump date, and the
+lump is legitimately not needed while the scenario itself did happen. Statuses and the contest
+pool come back as `option_statuses` and `options_applicable`.
+
+`lump_unused` is **not** part of the metric (the surplus already sits inside `deposit_income`,
+since `F = S + income`); it is returned for reference together with `*_status`.
+
+**Cash-flow parity is a contract, not a nice-to-have** (roadmap decision 7): every scenario must
+spend the same roubles in every month, apart from the month of the external contribution and the
+tail. Checked by `cash_parity_report()`; the answer carries `cash_parity`, `cash_parity_notes` and
+`cash_parity_ok`. A non-empty report means the comparison is invalid.
+
+A non-empty `monthly_budget` switches the comparison to the snowball family; the switch is visible
+through `baseline_kind` / `baseline_kind_reason` in the answer and in the parameters card.
 
 ---
 
@@ -299,7 +467,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV DB_PATH=/app/db/mortgage_web.db
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app/web
+EXPOSE 5000
 CMD ["python", "-m", "flask", "--app", "web/app/main.py", "run", "--host=0.0.0.0", "--port=5000"]
 ```
 
@@ -325,21 +494,38 @@ services:
 
 - Modern minimal style: white cards, subtle shadows, blue accent color (#2563EB).
 - Mobile-friendly layout, centered single column.
-- Progress indicator at the top showing current step (1 → 2 → Results).
+- Progress indicator at the top: 1 «Параметры» → 2 «Результат».
 - All currency values formatted with thousands separators (e.g. `1 500 000 ₽`).
-- Charts: a simple line chart comparing cumulative interest paid over time for each scenario (Chart.js).
-- No page reloads — JS posts to API, updates DOM with results.
+- Charts: remaining balance per scenario over time, and a bar chart of the gain per scenario (Chart.js).
+- No page reloads — JS posts to the API and updates the DOM.
+- Early-repayment rows in the schedule table get `class="row-early"` and a badge; the gate is
+  `row_kind === 'early'`, with a fallback for old saved answers that have no `row_kind`.
+
+---
+
+## Roadmap and Changelog
+
+`ROADMAP.md` is the plan: nine iterations (И0–И9), the wish list (W1–W9), 17 numbered decisions and
+the open questions. Before changing calculation behaviour, check whether a decision already covers
+it — decisions 2 (the invariant), 4 (single basis), 5 (`own_cost`), 7 (cash parity) and 17
+(the freed payment earns nothing) are load-bearing.
+
+`CHANGELOG.md` follows Keep a Changelog. Every entry that changes numbers must carry the
+**measured** before/after and the configuration it was measured in — estimates are not accepted.
+`scripts/snapshot_golden.py --accept` appends its own line there automatically.
 
 ---
 
 ## Legacy Telegram Bot (tgapp_legacy/)
 
-The original bot is in `tgapp_legacy/`. It is **not being modified**. The file `tgapp_legacy/mortgage.py` is imported by the web app for its `Mortgage` class and annuity calculation logic. All other `tgapp_legacy/` files are legacy.
+The original bot is in `tgapp_legacy/`. It is **not being modified** and is no longer imported by
+the web app — `web/app/` has no dependency on it at all.
 
 Known issues in legacy code (do not fix):
 - `tgapp_legacy/mortgage_count.py` line 11: broken import `from mortgage import Mortgage`
 - `tgapp_legacy/discussion_vote.py`, `tgapp_legacy/estimation_vote.py`: unused leftovers
-- `run.sh`: hard-coded path for Docker volume
+- `run.sh`: hard-coded path from another machine; it builds the web-app Dockerfile under the bot's
+  name. Not part of the web app, do not run it.
 
 ---
 
@@ -348,7 +534,12 @@ Known issues in legacy code (do not fix):
 - User authentication / multiple users
 - Variable interest rates on mortgage
 - Differentiated payment type (only annuity)
-- Deposit taxes (e.g. Russian 13% NDFL)
 - Insurance / commission fees on mortgage
 - Currency selection (rubles only, ₽)
-- Multiple partial repayments (only one lump sum)
+- Time value of money in `own_cost` (a scenario that closes three years earlier frees the whole
+  budget for those years; consciously accepted)
+- A separate reinvestment rate (the deposit rate is used)
+
+Planned, so **not** to be treated as out of scope: arbitrary numbers of early-repayment events
+(И9), optional deposit tax / НДФЛ off by default (И8), the deposit-profitability threshold (И8),
+one-page layout and unloaded cards (И4a).
