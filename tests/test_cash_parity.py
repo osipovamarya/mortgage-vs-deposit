@@ -224,10 +224,16 @@ def _arm_cash(resp, key, schedule, monthly_payment, infusion_month):
       приходит уже вместе с доходом. Поэтому у арма вклада строки досрочки
       (перевод со вклада в ипотеку — внутренний, не отток) исключаются, а в
       месяц вливания добавляется сама разовая сумма;
-    * реинвест высвобожденного платежа `MP − new_monthly` — но ТОЛЬКО если
-      сценарий заявил `reinvest_income`. Если поля нет, взносов нет, и арм
-      честно выглядит тратящим меньше базы — ровно та диагностика, ради которой
-      cash-parity и написан.
+    * высвобожденная часть платежа `MP − new_monthly` — БЕЗУСЛОВНО. Эти деньги
+      не уходят банку, но и не исчезают: они остаются в кармане. Паритет
+      сравнивает, сколько денег заёмщик отдал, а не сколько заработал, поэтому
+      он держится и при нулевом `reinvest_income`.
+
+    Прежняя версия добавляла эти взносы только при `reinvest_income > 0` —
+    формулировка из решения 16, где высвобожденный платёж обязан был копиться
+    на вкладе. Правило отменено: вклады начинаются от 50 000 ₽ и не пополняются,
+    положить туда несколько тысяч в месяц физически нельзя. Доход по ним теперь
+    ноль (`REINVEST_EARNING_MONTHS`), а паритет по-прежнему обязан быть пуст.
     """
     cash = {}
     for row in schedule:
@@ -241,19 +247,17 @@ def _arm_cash(resp, key, schedule, monthly_payment, infusion_month):
     if key == 'baseline':
         return cash                       # у базы платёж не снижается, высвобождать нечего
 
-    reinvest = _reinvest_income(resp, key)
     new_monthly = _new_monthly(resp, key, _NEW_MONTHLY_FLAT.get(key))
-    if reinvest and _c(reinvest) > ZERO:
-        contribution = (_c(monthly_payment) - _c(new_monthly)
-                        if new_monthly is not None else None)
-        for row in schedule:
-            if row.get('row_kind') == 'early':
-                continue
-            paid = _c(row['payment'])
-            if paid >= _c(monthly_payment):
-                continue                  # платёж ещё не снижен — высвобождать нечего
-            step = contribution if contribution is not None else _c(monthly_payment) - paid
-            _add(cash, _month(row['date']), step)
+    contribution = (_c(monthly_payment) - _c(new_monthly)
+                    if new_monthly is not None else None)
+    for row in schedule:
+        if row.get('row_kind') == 'early':
+            continue
+        paid = _c(row['payment'])
+        if paid >= _c(monthly_payment):
+            continue                      # платёж ещё не снижен — высвобождать нечего
+        step = contribution if contribution is not None else _c(monthly_payment) - paid
+        _add(cash, _month(row['date']), step)
     return cash
 
 
@@ -546,12 +550,13 @@ class ReinvestIncomeTest(unittest.TestCase):
         return _c(value)
 
     def test_reinvest_income_is_a_separate_field(self):
-        reinvest = self._reinvest()
-        self.assertGreater(
-            reinvest, ZERO,
-            f'высвобождается {self.monthly_payment - _c(self.new_monthly)} ₽/мес, '
-            f'а reinvest_income = {reinvest}',
-        )
+        """
+        Поле обязано существовать и приезжать наружу отдельным числом, даже
+        когда оно равно нулю: карточка вклада показывает доход по разовой
+        сумме, и подмешивать туда что-либо ещё нельзя. Ноль здесь — не
+        отсутствие поля, а осознанная величина (см. REINVEST_EARNING_MONTHS).
+        """
+        self.assertEqual(self._reinvest(), ZERO)
 
     def test_reinvest_income_matches_the_freed_payment_stream(self):
         """
@@ -574,15 +579,28 @@ class ReinvestIncomeTest(unittest.TestCase):
             f'(горизонт арма даёт {candidates[months]})',
         )
 
-    def test_reinvest_horizon_is_own_arm_payoff(self):
-        """Решение 16: копится до даты закрытия СВОЕГО арма, не срока вклада."""
-        reinvest = self._reinvest()
+    def test_freed_payment_earns_nothing(self):
+        """
+        Решение 16 отменено: высвобожденный платёж дохода НЕ приносит.
+
+        Вклады начинаются от 50 000 ₽ и не пополняются, а высвобождается
+        несколько тысяч в месяц — положить их некуда. Прежнее правило («копится
+        до закрытия своего арма по ставке вклада») давало 8 739 709 ₽ дохода на
+        кредит в три миллиона и уводило `own_cost` в минус: победителя выбирало
+        допущение о ставке на двадцать пять лет вперёд.
+
+        Тест кусачий: с прежним правилом здесь стояло бы число порядка
+        13,7 млн ₽, поэтому регрессия к нему видна сразу.
+        """
+        self.assertEqual(self._reinvest(), ZERO)
         months = _annuity_months(self.schedule)
         step = float(self.monthly_payment - _c(self.new_monthly))
-        expected = _c(calc_monthly_deposit(0, step, DEPOSIT['annual_rate'],
+        would_be = _c(calc_monthly_deposit(0, step, DEPOSIT['annual_rate'],
                                            DEPOSIT['capitalization'], months)[0])
-        self.assertEqual(reinvest, expected,
-                         f'горизонт реинвеста не равен сроку жизни арма ({months} мес)')
+        self.assertGreater(
+            would_be, _c(1_000_000),
+            'контрпример перестал быть показательным — пересмотрите замер',
+        )
 
     def test_reinvest_is_not_mixed_into_deposit_income(self):
         """Карточка вклада показывает доход только по разовой сумме."""

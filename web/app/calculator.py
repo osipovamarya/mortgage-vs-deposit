@@ -474,31 +474,67 @@ def _freed_by_month(schedule, contract_payment):
     return freed
 
 
-def calc_reinvest_income(contributions, annual_rate, capitalization):
+# Сколько месяцев высвобожденный платёж реально приносит доход.
+#
+# Ноль: на вклад его положить некуда. Вклады начинаются от 50 000 ₽ и не
+# пополняются, а высвобождается несколько тысяч в месяц — собирать разницу
+# вручную и раз в полгода открывать новый вклад пользователь не будет, это
+# ровно то решение, которое калькулятор должен избавить от повторения.
+# Вкладывается только РАЗОВАЯ сумма: она уже лежит готовой.
+#
+# Замер, ради которого правило введено: ипотека 2 983 243 ₽ под 7,99 % на
+# 294 месяца, вклад 16 %, высвобожденные 2 635 ₽/мес. При начислении на весь
+# горизонт арма reinvest_income = 8 739 709 ₽ на кредит в три миллиона,
+# own_cost уходит в минус (−5 322 774 ₽), и «уменьшить платёж» побеждает
+# из-за допущения о ставке на двадцать пять лет вперёд, а не из-за экономики.
+REINVEST_EARNING_MONTHS = 0
+
+
+def calc_reinvest_income(contributions, annual_rate, capitalization,
+                         earning_months=None):
     """
     Доход по потоку высвобожденных платежей (решения 7 и 16 роадмапа).
 
     `contributions` — взносы по месяцам жизни арма в хронологическом порядке.
-    Горизонт — закрытие СВОЕГО арма: последний взнос дохода уже не приносит.
+
+    `earning_months` — сколько первых месяцев деньги действительно приносят
+    доход; дальше высвобожденный платёж просто копится без процентов. По
+    умолчанию это срок вклада пользователя. Ставка вклада действует свой срок
+    (обычно 6-12 месяцев), а горизонт арма — весь остаток ипотеки, и применять
+    к нему сегодняшнюю ставку значит выдумывать доходность на двадцать лет
+    вперёд. Замер, ради которого правило и введено: ипотека 2 983 243 ₽ под
+    7,99 % на 294 месяца, вклад 16 %, высвобожденные 2 635 ₽/мес — при
+    начислении на весь горизонт `reinvest_income` = 8 739 709 ₽ на кредит в
+    три миллиона, `own_cost` уходит в минус, и «уменьшить платёж» побеждает
+    из-за допущения, а не из-за экономики.
+
+    Сами взносы в доход не входят: они не тратятся, но и не исчезают —
+    общий отток заёмщика равен телу плюс проценты в любом арме, поэтому
+    высвобожденные деньги влияют только доходом, который на них заработан.
+
     Соглашение о начислении то же, что в `calc_monthly_deposit`.
     """
     months = len(contributions)
     if not months or not annual_rate:
         return 0.0
+    horizon = months if earning_months is None else min(int(earning_months), months)
+    if horizon <= 0:
+        return 0.0
     monthly_rate = float(annual_rate) / 100 / 12
     if capitalization:
         balance = 0.0
-        for amount in contributions:
+        for amount in contributions[:horizon]:
             balance = balance * (1 + monthly_rate) + amount
-        income = balance - sum(contributions)
+        income = balance - sum(contributions[:horizon])
     else:
         income = 0.0
-        for k, amount in enumerate(contributions, start=1):
-            income += amount * monthly_rate * (months - k)
+        for k, amount in enumerate(contributions[:horizon], start=1):
+            income += amount * monthly_rate * (horizon - k)
     return round(income, 2)
 
 
-def _reinvest_of(schedule, contract_payment, annual_rate, capitalization):
+def _reinvest_of(schedule, contract_payment, annual_rate, capitalization,
+                 earning_months=None):
     """
     Доход по высвобожденному платежу арма и сами взносы по месяцам.
 
@@ -516,7 +552,9 @@ def _reinvest_of(schedule, contract_payment, annual_rate, capitalization):
         if key not in months:
             months.append(key)
     contributions = [freed.get(key, 0.0) for key in months]
-    return calc_reinvest_income(contributions, annual_rate, capitalization), freed
+    income = calc_reinvest_income(contributions, annual_rate, capitalization,
+                                  earning_months=earning_months)
+    return income, freed
 
 
 def _withdrawals_of(schedule):
@@ -635,6 +673,9 @@ def run_comparison(mortgage, deposit, strategy=None):
 
     deposit_rate = float(deposit['annual_rate']) if deposit else 0.0
     deposit_cap = bool(deposit['capitalization']) if deposit else True
+    # Горизонт начисления на высвобожденный платёж: ставка вклада действует
+    # свой срок, дальше деньги копятся без процентов (см. calc_reinvest_income).
+    deposit_term_months = int(deposit['term_months']) if deposit else 0
 
     def _lump_result(amount, at_date, mode):
         """Полный результат движка по одной разовой досрочке."""
@@ -652,9 +693,17 @@ def run_comparison(mortgage, deposit, strategy=None):
         return simulate_strategy(state, events, opts)
 
     def _reinvest(result):
-        """Доход по высвобожденному платежу арма (решения 7 и 16)."""
+        """
+        Доход по высвобожденному платежу арма (решения 7 и 16, исправленные).
+
+        `REINVEST_EARNING_MONTHS = 0`: высвобожденные несколько тысяч рублей в
+        месяц положить на вклад физически некуда — вклады начинаются от 50 000 ₽
+        и не пополняются. Деньги остаются в кармане и учитываются паритетом
+        как непотраченные, но дохода не приносят.
+        """
         return _reinvest_of(result.schedule, mortgage['monthly_payment'],
-                            deposit_rate, deposit_cap)
+                            deposit_rate, deposit_cap,
+                            earning_months=REINVEST_EARNING_MONTHS)
 
     # --- Strategy A: keep lump_sum on deposit for T months, then repay ---
     deposit_income = 0.0
