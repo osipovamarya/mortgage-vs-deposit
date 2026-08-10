@@ -35,7 +35,6 @@ def create_comparison():
 
     # Pop non-DB fields before insert
     base_schedule = result.pop('base_schedule')
-    result.pop('balance_after_deposit', None)
     deposit_schedule = result.pop('deposit_schedule')
     reduce_payment_schedule = result.pop('reduce_payment_schedule')
     reduce_term_schedule = result.pop('reduce_term_schedule')

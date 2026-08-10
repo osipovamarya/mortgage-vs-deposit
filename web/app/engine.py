@@ -203,7 +203,11 @@ class StrategyResult:
     dates: list                           # ЕДИНСТВЕННАЯ сетка дат платежей
     lump_unused: float = 0.0              # справочно; в own_cost не входит
     status: str = STATUS_OK
-    carried_interest: float = 0.0         # непредъявленный остаток процентов, обязан быть 0
+    # Поля `carried_interest` здесь нет намеренно: непредъявленный остаток
+    # процентов живёт ровно один период (`interest_first` его накапливает, а
+    # ближайший аннуитет обязан его унести), поэтому наружу он выходил
+    # структурным нулём. Проверяется по графику — см.
+    # tests/test_early_repayment_allocation.py::test_carried_interest_lands_on_the_next_annuity.
 
 
 @dataclass
@@ -260,12 +264,18 @@ def _accrue(segments, basis, month_span, monthly_rate, daily_rate):
     Свойство, ради которого функция написана: один сегмент на весь период при
     `basis='monthly'` даёт ровно `bal · monthly_rate`. Значит, включение любого
     режима без изменения денежных потоков даёт нулевую дельту процентов.
+
+    Отрезок отрицательной длины (конец раньше начала) не начисляет ничего.
+    Через API такой отрезок сегодня не построить, но `prev_payment_date` позже
+    первой даты платежа дал бы ОТРИЦАТЕЛЬНЫЕ проценты в базе `daily` и ровно
+    ноль в `monthly` — расхождение баз на пустом месте. Условие `days > 0`
+    держит обе базы в одном ответе.
     """
     if basis == BASIS_DAILY:
         total = _ZERO
         for start, end, balance in segments:
             days = (end - start).days
-            if days:
+            if days > 0:
                 total += balance * daily_rate * _d(days)
         return _r2(total)
 
@@ -423,6 +433,9 @@ def simulate_strategy(state, events, opts=None):
     balance = _d(state.loan_amount)
     remaining_term = n
     lump_unused = _ZERO
+    # Непредъявленный остаток процентов режима `interest_first`. Живёт ровно
+    # один период: строка (2) ниже прибавляет его к процентам ближайшего
+    # аннуитета и тут же обнуляет, поэтому за границу периода он не выходит.
     carried_interest = _ZERO
     status = STATUS_OK
 
@@ -431,9 +444,19 @@ def simulate_strategy(state, events, opts=None):
     annuity_months = 0
 
     def _annuity(bal, periods):
-        """Аннуитет, закрывающий `bal` за `periods` месяцев."""
+        """
+        Аннуитет, закрывающий `bal` за `periods` месяцев.
+
+        Беспроцентный договор (`annual_rate = 0`) считается отдельной ветвью:
+        при нулевой месячной ставке `factor = 1`, знаменатель `factor − 1`
+        обращается в ноль и общая формула роняет расчёт через
+        `decimal.InvalidOperation`. Экономически это вырожденный, но законный
+        случай — тело просто делится на число периодов.
+        """
         if periods <= 0 or bal <= _ZERO:
             return _ZERO
+        if monthly_rate == _ZERO:
+            return _r2(bal / _d(periods))
         factor = (1 + monthly_rate) ** periods
         return _r2(bal * monthly_rate * factor / (factor - 1))
 
@@ -602,13 +625,25 @@ def simulate_strategy(state, events, opts=None):
     #    Ежемесячные доплаты в дренаж НЕ идут: их «неприменение» означает, что
     #    кредит закрылся раньше конца графика, и записывать неистраченный бюджет
     #    в `lump_unused` («не понадобилось +X ₽» разовой суммы) было бы враньём.
+    drained = False
     for pending in all_pending:
         if pending.applied or pending.event.kind == KIND_RECURRING:
             continue
         amount = _resolve_amount(pending.event, payment_in_force)
         if amount > _ZERO:
             lump_unused += amount
-            status = STATUS_NOT_APPLICABLE
+            drained = True
+
+    # `not_applicable` означает ровно одно: стратегия не сделала НИЧЕГО, её
+    # график побайтово равен базовому. Только такой сценарий обязан вылетать из
+    # конкурса победителей — иначе он «экономит» 0,00 ₽, что больше любой
+    # отрицательной величины, и выигрывает, ничего не сделав.
+    #
+    # Неистраченная разовая сумма сама по себе статуса НЕ меняет: в снежном коме
+    # кредит закрывается ежемесячными доплатами раньше даты досрочки, и досрочка
+    # штатно оказывается не нужна — сценарий при этом вполне состоялся.
+    if drained and not any(pending.applied for pending in all_pending):
+        status = STATUS_NOT_APPLICABLE
 
     for index, row in enumerate(schedule):
         row['payment_num'] = index + 1
@@ -622,5 +657,4 @@ def simulate_strategy(state, events, opts=None):
         dates=dates,
         lump_unused=float(_r2(lump_unused)),
         status=status,
-        carried_interest=float(_r2(carried_interest)),
     )

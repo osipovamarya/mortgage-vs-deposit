@@ -16,8 +16,12 @@ ALLOWED_ALLOCATIONS = ('principal_only', 'interest_first')
 def create_mortgage():
     data = request.get_json()
 
+    # Пусто — это None и пустая строка, но НЕ ноль: ставка 0 % (беспроцентная
+    # рассрочка) — законный ввод, а не отсутствие поля. Нижние границы
+    # проверяются ниже отдельно и с понятным текстом ошибки.
     for field in ('loan_amount', 'annual_rate', 'first_payment_date', 'last_payment_date', 'monthly_payment'):
-        if not data.get(field):
+        value = data.get(field)
+        if value is None or value == '':
             return jsonify({'error': f'Поле обязательно: {field}'}), 400
 
     try:
@@ -29,10 +33,30 @@ def create_mortgage():
     if first_dt >= last_dt:
         return jsonify({'error': 'Дата последнего платежа должна быть позже первого'}), 400
 
+    # Сетка платежей строится от `first + 1 месяц` до `last`. Договор короче
+    # месяца («первый платёж 02.02.2026, последний 15.02.2026») даёт пустую
+    # сетку, а дальше `schedule[0]` роняет расчёт с IndexError и 500-й.
+    # Предстоящих платежей в таком договоре и правда нет — это ошибка ввода.
+    if last_dt < first_dt + relativedelta(months=1):
+        return jsonify({
+            'error': 'Между первым и последним платежом должен быть хотя бы один месяц: '
+                     'предстоящих платежей в этом договоре не остаётся'
+        }), 400
+
     loan_amount = float(data['loan_amount'])
     annual_rate = float(data['annual_rate'])
     monthly_payment = float(data['monthly_payment'])
     adjust_business_days = 1 if data.get('adjust_business_days') else 0
+
+    # Нижние границы. Ставка 0 % допустима (беспроцентная рассрочка) и движком
+    # поддержана отдельной ветвью аннуитета, а отрицательная ставка или
+    # отрицательные деньги — заведомая ошибка ввода, а не расчётный случай.
+    if loan_amount <= 0:
+        return jsonify({'error': 'Остаток долга должен быть больше нуля'}), 400
+    if annual_rate < 0:
+        return jsonify({'error': 'Годовая ставка не может быть отрицательной'}), 400
+    if monthly_payment <= 0:
+        return jsonify({'error': 'Ежемесячный платёж должен быть больше нуля'}), 400
 
     next_dt = first_dt + relativedelta(months=1)
     schedule, _, total_interest = build_amortization(

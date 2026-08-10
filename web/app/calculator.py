@@ -21,6 +21,7 @@ from .engine import (
     MODE_PAYMENT,
     ROW_ANNUITY,
     ROW_EARLY,
+    STATUS_NOT_APPLICABLE,
     STATUS_OK,
     MortgageState,
     RepaymentEvent,
@@ -33,8 +34,6 @@ from .engine import (
     _parse_date,
     _r2,
 )
-
-_CENT = Decimal('0.01')
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +88,11 @@ def build_amortization(loan_amount, annual_rate, first_payment_date, last_paymen
         contract_payment=fixed_payment,
     )
     result = simulate_strategy(state, [], SimOptions(basis=basis_for(adjust_business_days)))
-    return result.schedule, result.schedule[0]['payment'], result.total_interest
+    # Пустая сетка (договор короче месяца: 02.02.2026 → 15.02.2026) больше не
+    # роняет расчёт по `schedule[0]`. Ввод такого договора отсекается в
+    # routes/mortgage.py, здесь остаётся честный ответ «предстоящих платежей нет».
+    first_payment = result.schedule[0]['payment'] if result.schedule else 0.0
+    return result.schedule, first_payment, result.total_interest
 
 
 def _amortization_without_fixed_payment(loan_amount, annual_rate,
@@ -241,6 +244,11 @@ def simulate_lump_repayment(loan_amount, annual_rate, first_payment_date, last_p
 
     Returns: (schedule, monthly_payment_after_lump, total_interest, annuity_months)
     `annuity_months` counts real payments only, early-repayment rows excluded.
+
+    Кортеж намеренно остался четырёхэлементным: его форма зафиксирована
+    голденами (`tests/golden/simulate_lump_repayment.json`). `status` и
+    `lump_unused` живут на `StrategyResult`, и `run_comparison()` берёт полный
+    результат движка напрямую — через эту обёртку они и не должны ходить.
     """
     state = MortgageState(
         loan_amount=loan_amount,
@@ -597,7 +605,14 @@ def run_comparison(mortgage, deposit, strategy=None):
 
         own_cost = total_interest − deposit_income − reinvest_income
         interest_saved = own_cost базы − own_cost сценария
-        winner = argmin(own_cost) ≡ argmax(interest_saved)
+        winner = argmax(interest_saved) по СОСТОЯВШИМСЯ сценариям
+
+    Сценарий, который не сделал ничего и ничего не дал (`status='not_applicable'`
+    при нулевой выгоде — например, дата досрочки за концом графика), из конкурса
+    исключается: его экономия равна ровно 0,00 ₽, что больше любой
+    отрицательной, и он побеждал бы, ничего не сделав (решение 6 роадмапа).
+    Статусы приезжают в ответе полем `option_statuses`, пул конкурса — полем
+    `options_applicable`.
 
     `lump_unused` в метрику НЕ входит: излишек уже сидит внутри `deposit_income`
     (F = S + income), вычесть его второй раз значило бы завысить выгоду.
@@ -654,7 +669,11 @@ def run_comparison(mortgage, deposit, strategy=None):
     # вливания вклада бралась из необработанного rrule, а график шёл по датам,
     # сдвинутым на рабочий день, — две сетки расходились на выходных.
     payment_dates = baseline.dates
-    original_n = len(payment_dates)
+    # Длина СЕТКИ дат и число РЕАЛЬНЫХ платежей — разные числа: введённый платёж
+    # больше аннуитета закрывает кредит раньше последней даты договора. Всё, что
+    # сравнивается с `months_to_payoff` сценария или индексирует график, обязано
+    # считаться отсюда, а не из `len(payment_dates)`.
+    baseline_months = baseline.months_to_payoff
 
     # Индексы снежка считаются по ТОЙ ЖЕ сетке: с Итерации 3 снежок знает про
     # перенос на рабочий день, и сырой rrule больше не нужен — иначе индекс из
@@ -714,14 +733,19 @@ def run_comparison(mortgage, deposit, strategy=None):
     deposit_lump_unused = 0.0
     deposit_total_interest = baseline_total_interest
     deposit_status = STATUS_OK
-    balance_after_deposit = mortgage['loan_amount']
     deposit_schedule = list(base_schedule)
     deposit_cash_extra = {}
     deposit_exclude_months = set()
     maturity_idx = None
 
     if lump_sum > 0 and deposit:
-        term_months = min(int(deposit['term_months']), original_n)
+        # Срок вклада зажимается длиной РЕАЛЬНОГО графика, а не сетки дат:
+        # введённый платёж больше аннуитета закрывает кредит раньше последней
+        # даты договора, и график тогда короче сетки. Зажим по длине СЕТКИ ронял
+        # расчёт (IndexError → 500) на входе «остаток 1 000 000 ₽, 10 %,
+        # 02.02.2026 → 02.01.2031 (60 дат), платёж 50 000 ₽»: график там
+        # 22 строки, а вклад на 36 месяцев просил `base_schedule[35]`.
+        term_months = min(int(deposit['term_months']), len(base_schedule))
         # ОДИН индекс закрытия вклада на всё сравнение: и здесь, и в снежке.
         # Раньше снежок брал min(term, n − 1) и гасил месяцем позже, чем арм A.
         maturity_idx = max(term_months - 1, 0)
@@ -732,9 +756,6 @@ def run_comparison(mortgage, deposit, strategy=None):
         deposit_income, deposit_final = calc_deposit(
             lump_sum, deposit['annual_rate'], term_months, deposit['capitalization'],
         )
-
-        balance_after_deposit = (base_schedule[maturity_idx]['balance']
-                                 if term_months > 0 else mortgage['loan_amount'])
 
         # Money becomes available right after the payment that closes the deposit term.
         # Дата берётся из сетки движка, а не из сырого rrule.
@@ -774,7 +795,7 @@ def run_comparison(mortgage, deposit, strategy=None):
     reduce_payment_interest_saved = 0.0
     new_monthly_b = mortgage['monthly_payment']
     reduce_term_interest_saved = 0.0
-    reduce_term_months_to_payoff = original_n
+    reduce_term_months_to_payoff = baseline_months
     reduce_term_months_saved = 0
     reduce_payment_schedule = list(base_schedule)
     reduce_term_schedule = list(base_schedule)
@@ -811,7 +832,11 @@ def run_comparison(mortgage, deposit, strategy=None):
             baseline_total_interest - reduce_term_total_interest
             + reduce_term_reinvest_income, 2)
         reduce_term_months_to_payoff = result_b2.months_to_payoff
-        reduce_term_months_saved = original_n - result_b2.months_to_payoff
+        # Обе величины на карточке считаются от РЕАЛЬНОГО базового графика.
+        # Раньше здесь стояла длина сетки дат, и числа на одной карточке
+        # противоречили друг другу: «кредит закрыт за 20 месяцев» рядом с
+        # «сэкономлено 39 месяцев» на базе в 22 платежа.
+        reduce_term_months_saved = max(baseline_months - result_b2.months_to_payoff, 0)
 
     # --- Strategy C: snowball ---
     snowball_fields = {}
@@ -891,7 +916,36 @@ def run_comparison(mortgage, deposit, strategy=None):
     if snowball_fields:
         options['snowball'] = snowball_fields['snowball_interest_saved']
 
-    winner = max(options, key=options.get)
+    # Статус сценария рядом с его выгодой (решение 6 роадмапа). Несостоявшееся
+    # событие — дата досрочки за концом графика — даёт график, побайтово равный
+    # базовому, и экономию ровно 0,00 ₽. Ноль больше любой отрицательной
+    # величины, поэтому в конкурсе по `max` такой сценарий выигрывал у реального
+    # вклада и приложение рекомендовало досрочку, которой не будет.
+    option_statuses = {
+        'deposit': deposit_status,
+        'reduce_payment': reduce_payment_status,
+        'reduce_term': reduce_term_status,
+    }
+    if snowball_fields:
+        option_statuses['snowball'] = snowball_fields['snowball_status']
+
+    # Из конкурса вылетает сценарий, который НИЧЕГО НЕ СДЕЛАЛ И НИЧЕГО НЕ ДАЛ:
+    # событие не состоялось И выгода равна нулю. Обоих условий сразу, потому что
+    # `not_applicable` приходит от движка и говорит только про ипотечную часть.
+    # У арма вклада ипотечное событие тоже может не состояться (кредит закрылся
+    # раньше, чем созрел вклад), но проценты по вкладу при этом реально
+    # заработаны — такой арм остаётся в конкурсе.
+    #
+    # Если не состоялся ни один сценарий, выбор идёт по всем: выбирать иначе
+    # было бы не из чего.
+    def _is_dead(name, value):
+        return (option_statuses.get(name) == STATUS_NOT_APPLICABLE
+                and abs(value) < 0.005)
+
+    applicable = {name: value for name, value in options.items()
+                  if not _is_dead(name, value)}
+    pool = applicable or options
+    winner = max(pool, key=pool.get)
 
     # own_cost = проценты − доход по вкладу − доход по реинвесту (решение 5).
     # `lump_unused` в метрику не входит: излишек уже внутри `deposit_income`.
@@ -932,7 +986,8 @@ def run_comparison(mortgage, deposit, strategy=None):
         'entered_monthly_payment': mortgage['monthly_payment'],
         'early_repayment_allocation': allocation,
         'base_schedule': base_schedule,
-        'balance_after_deposit': balance_after_deposit,
+        # Поля `balance_after_deposit` в ответе нет: его никто не читал —
+        # роут выбрасывал его до записи в БД, в app.js и в шаблонах его не было.
         # База сравнения (решение 7): переключение обязано быть видимым
         'baseline_kind': baseline_kind,
         'baseline_kind_reason': baseline_kind_reason,
@@ -970,6 +1025,10 @@ def run_comparison(mortgage, deposit, strategy=None):
         # Summary
         'winner': winner,
         'options': options,
+        # Статус каждого варианта и пул, из которого выбран победитель:
+        # сценарий со `status='not_applicable'` в конкурсе не участвует.
+        'option_statuses': option_statuses,
+        'options_applicable': applicable,
         'own_cost': own_cost,
         'cash_parity': cash_parity,
         'cash_parity_notes': cash_parity_notes,

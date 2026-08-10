@@ -732,13 +732,19 @@ function renderScheduleTable(tab, schedules) {
     const paymentCell = isFirst
       ? `${rub(r.payment)} <small class="fact-payment">(факт: ${rub(entered)})</small>`
       : rub(r.payment);
-    // В строке есть досрочная часть — её показываем бейджем при основном долге.
-    const hasEarly = r.early && r.early > 0.5;
+    // Часть строки, ушедшая в тело досрочно.
+    const earlyPrincipal = r.early || 0;
     // Отдельная строка досрочки: движок отдаёт row_kind, старый ответ — нет,
     // тогда откатываемся на прежнюю эвристику «досрочка без процентов».
+    // Гейт отрисовки — именно вид строки, а не сумма тела: в режиме
+    // interest_first вся досрочка может уйти в проценты периода, тогда
+    // early = 0, и по сумме тела строка неотличима от планового платежа.
     const isEarlyRow = typeof r.row_kind === 'string'
       ? r.row_kind === 'early'
-      : (hasEarly && r.interest === 0);
+      : (earlyPrincipal > 0.5 && r.interest === 0);
+    // Досрочная часть внутри плановой строки (старые сохранённые ответы).
+    const hasEarlyPart = !isEarlyRow && earlyPrincipal > 0.5;
+    const isEarly = isEarlyRow || hasEarlyPart;
     // В режиме interest_first часть досрочки ушла в проценты периода.
     const earlyInterest = r.early_interest || 0;
     let earlyLabel;
@@ -747,13 +753,13 @@ function renderScheduleTable(tab, schedules) {
         ? `досрочно (проценты ${rub(earlyInterest)})`
         : 'досрочно';
     } else {
-      earlyLabel = `+${rub(r.early)} досрочно`;
+      earlyLabel = `+${rub(earlyPrincipal)} досрочно`;
     }
-    const principalCell = hasEarly
+    const principalCell = isEarly
       ? `${rub(r.principal)} <span class="early-badge">${earlyLabel}</span>`
       : rub(r.principal);
     return `
-    <tr${hasEarly ? ' class="row-early"' : ''}>
+    <tr${isEarly ? ' class="row-early"' : ''}>
       <td>${r.payment_num}</td>
       <td>${r.date}</td>
       <td>${paymentCell}</td>
