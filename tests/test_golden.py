@@ -145,9 +145,17 @@ class KnownBugsRegistryTest(unittest.TestCase):
 
     def test_roadmap_control_measurement(self):
         """
-        Контрольный замер роадмапа: 8 000 000 ₽ @ 16 %, бюджет 40 000, extra_day 15
-        → 299 строк, Σ principal = 0.00, финальный баланс 8 000 000.00;
-        тот же вход с extra_day=None → Σ principal = 8 000 000.00.
+        Контрольный замер роадмапа: 8 000 000 ₽ @ 16 %, бюджет 40 000, extra_day 15.
+
+        ДО И3 недоплата: 299 строк, Σ principal = 0.00, финальный баланс
+        8 000 000.00 — аннуитет обрезался бюджетом (`min(annuity, budget)`),
+        и тело долга не гасилось вовсе.
+
+        ПОСЛЕ И3 (снято `min(annuity, budget)`, аннуитет платится полностью,
+        бюджет идёт сверху) недоплаты не существует ни при каком бюджете:
+        последний плановый платёж всегда добивает остаток. Тест закрепляет
+        исправленное поведение и держит `extra_day=15` и `extra_day=None`
+        неразличимыми — база начисления днём доплаты больше не переключается.
         """
         with open(KNOWN_BUGS_PATH, encoding='utf-8') as fh:
             stored = json.load(fh)
@@ -159,14 +167,17 @@ class KnownBugsRegistryTest(unittest.TestCase):
         )
         self.assertTrue(control['matches_roadmap'])
 
-        bug = control['measured_with_extra_day_15']
-        self.assertEqual(bug['rows'], 299)
-        self.assertEqual(bug['sum_principal'], 0.0)
-        self.assertEqual(bug['final_balance'], 8_000_000.0)
+        fixed = control['measured_with_extra_day_15']
+        self.assertEqual(fixed['sum_principal'], 8_000_000.0)
+        self.assertEqual(fixed['final_balance'], 0.0)
 
         ok = control['measured_with_extra_day_none']
         self.assertEqual(ok['sum_principal'], 8_000_000.0)
         self.assertEqual(ok['final_balance'], 0.0)
+        self.assertEqual(
+            fixed['total_interest'], ok['total_interest'],
+            'monthly_extra_day снова переключает базу начисления (регрессия И3a-3)',
+        )
 
     def test_every_registered_case_really_underpays(self):
         """Критерий реестра вычислен по факту: остаток не закрыт к концу графика."""

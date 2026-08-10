@@ -3,7 +3,9 @@
 
 Итерация 1 роадмапа: вместо двух независимых реализаций досрочки в
 ``calculator.py`` появляется один помесячный цикл, а ``build_amortization()``
-и ``simulate_lump_repayment()`` становятся его тонкими обёртками.
+и ``simulate_lump_repayment()`` становятся его тонкими обёртками. Итерация 3
+добавила ежемесячные события (``kind='recurring'``), и обёрткой стал ещё и
+снежный ком ``calc_repayment_schedule()`` — независимых движков не осталось.
 
 Главная идея — **начисление процентов списком сегментов**, а не тремя
 спецслучаями. Период между двумя плановыми платежами разрезается событиями на
@@ -28,6 +30,7 @@
 Модуль не импортирует ``calculator`` (обратной зависимости нет) и ничего не
 знает ни про Flask, ни про БД.
 """
+from calendar import monthrange
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -50,6 +53,14 @@ ROW_EARLY = 'early'
 # --- Режим досрочки (живёт НА СОБЫТИИ) ---------------------------------------
 MODE_PAYMENT = 'reduce_payment'   # тот же срок, аннуитет пересчитывается
 MODE_TERM = 'reduce_term'         # тот же платёж, кредит закрывается раньше
+
+# --- Вид события (Итерация 3) -------------------------------------------------
+KIND_LUMP = 'lump'                # разовая досрочка
+KIND_RECURRING = 'recurring'      # ежемесячная доплата (снежный ком)
+
+# --- Как читать `amount` события ----------------------------------------------
+AMOUNT_FIXED = 'fixed'    # сумма как есть
+AMOUNT_BUDGET = 'budget'  # «всего готов платить в месяц»: досрочка = amount − платёж
 
 # --- Статус сценария ----------------------------------------------------------
 STATUS_OK = 'ok'
@@ -133,17 +144,43 @@ class MortgageState:
 @dataclass
 class RepaymentEvent:
     """
-    Досрочный платёж.
+    Досрочный платёж: разовый (`lump`) или ежемесячный (`recurring`).
 
     `mode` живёт именно на событии — это ключ к смешанным стратегиям (W2).
     `allocation=None` означает «взять из SimOptions».
+
+    Поля `lump`
+        `at` — дата платежа; None → применить сразу, до первого планового платежа.
+
+    Поля `recurring` (Итерация 3, снежный ком)
+        `start_date`    — с какой даты платежа включается доплата (None → с первой);
+        `end_date`      — по какую включительно (None → до конца графика);
+        `day_of_month`  — день доплаты; None → в саму дату планового платежа.
+                          День прижимается к длине месяца (31 → 30/28). Если он
+                          ПОЗЖЕ даты платежа, доплата уходит внутрь следующего
+                          периода и период начисления делится; если не позже —
+                          платится в дату платежа, сразу после аннуитета;
+        `period_months` — 1 = каждый месяц, 2 = через месяц (смешанный ком, W2);
+        `phase`         — сдвиг фазы для `period_months > 1`.
+
+    `amount_kind='budget'` означает «всего готов платить в месяц»: сумма события
+    резолвится В МОМЕНТ ПРИМЕНЕНИЯ как `amount − уплаченный в этом периоде
+    аннуитет`, поэтому в `reduce_payment` доплата растёт по мере падения
+    аннуитета сама собой, а в `reduce_term` остаётся постоянной — без единой
+    ветки `if mode`.
     """
 
     amount: float
     at: datetime = None                   # None → применить сразу, до первого платежа
-    kind: str = 'lump'                    # 'lump' | 'recurring' (recurring — Итерация 3)
+    kind: str = KIND_LUMP                 # 'lump' | 'recurring'
     mode: str = MODE_PAYMENT
     allocation: str = None
+    amount_kind: str = AMOUNT_FIXED       # 'fixed' | 'budget'
+    start_date: datetime = None           # recurring: первая дата платежа с доплатой
+    end_date: datetime = None             # recurring: последняя дата платежа с доплатой
+    day_of_month: int = None              # recurring: день доплаты внутри месяца
+    period_months: int = 1                # recurring: раз в сколько месяцев
+    phase: int = 0                        # recurring: сдвиг фазы
 
 
 @dataclass
@@ -245,6 +282,63 @@ def _accrue(segments, basis, month_span, monthly_rate, daily_rate):
 # Материализация событий по сетке
 # ---------------------------------------------------------------------------
 
+def _resolve_amount(event, annuity_paid):
+    """
+    Сумма события в момент применения.
+
+    `amount_kind='budget'` — «всего готов платить в месяц»: доплата равна
+    остатку бюджета сверх уже уплаченного в этом периоде аннуитета. Резолвить
+    заранее нельзя: в `reduce_payment` аннуитет падает от события к событию, и
+    заранее посчитанная доплата отстала бы от реальности.
+
+    Вычитается именно **фактически уплаченный** аннуитет, а не платёж «в силе»:
+    иначе в месяце разовой досрочки, которая пересчитывает аннуитет между
+    платежом и доплатой, месячный расход перестал бы равняться бюджету.
+    """
+    amount = _d(event.amount or 0)
+    if event.amount_kind == AMOUNT_BUDGET:
+        return max(amount - annuity_paid, _ZERO)
+    return amount
+
+
+def _recurring_dates(event, dates):
+    """
+    Даты ежемесячной доплаты — ПО СЕТКЕ платежей, а не по календарю.
+
+    Раскрытие по сетке обязательно: иначе перенос платежа на рабочий день
+    уводил бы доплату от аннуитета и появлялся бы дрейф.
+
+    Для каждой подходящей даты платежа:
+
+    * `day_of_month=None` → доплата в саму дату платежа (её обработает ветка
+      «событие в дату платежа», то есть строго после аннуитета);
+    * иначе день прижимается к длине месяца (31 → 30/28). Если получившаяся дата
+      ПОЗЖЕ даты платежа — доплата попадает внутрь следующего периода и делит его
+      начисление; если не позже — платится в дату платежа. Второе повторяет
+      прежнее поведение снежка (`monthly_extra_day` работал только «позже дня
+      аннуитета», см. `calc_repayment_schedule`).
+    """
+    start = _parse_date(event.start_date)
+    end = _parse_date(event.end_date)
+    period = max(int(event.period_months or 1), 1)
+    phase = int(event.phase or 0)
+    day = int(event.day_of_month) if event.day_of_month else None
+
+    window = [date for date in dates
+              if (start is None or date >= start) and (end is None or date <= end)]
+
+    out = []
+    for step, date in enumerate(window):
+        if step < phase or (step - phase) % period:
+            continue
+        if day is None:
+            out.append(date)
+            continue
+        candidate = date.replace(day=min(day, monthrange(date.year, date.month)[1]))
+        out.append(candidate if candidate > date else date)
+    return out
+
+
 def _materialize(events, dates, anchor):
     """
     Разложить события по сетке платежей.
@@ -258,6 +352,9 @@ def _materialize(events, dates, anchor):
     * `late`    — дата за последним платежом: событие не состоится;
     * `all_pending` — те же объекты одним списком, для дренажа неприменённых.
 
+    Ежемесячное событие раскрывается здесь же в список одиночных применений, и
+    дальше цикл симуляции ничего не знает про его периодичность.
+
     Границы периодов статичны, потому что сетка дат фиксирована до симуляции.
     """
     inside = [[] for _ in dates]
@@ -266,13 +363,17 @@ def _materialize(events, dates, anchor):
     late = []
     all_pending = []
 
-    ordered = sorted(
-        enumerate(events),
-        key=lambda pair: (_parse_date(pair[1].at) or anchor, pair[0]),
-    )
+    expanded = []
+    for index, event in enumerate(events):
+        if event.kind == KIND_RECURRING:
+            for step, at in enumerate(_recurring_dates(event, dates)):
+                expanded.append((at, (index, step + 1), event))
+        else:
+            expanded.append((_parse_date(event.at), (index, 0), event))
 
-    for _index, event in ordered:
-        at = _parse_date(event.at)
+    ordered = sorted(expanded, key=lambda item: (item[0] or anchor, item[1]))
+
+    for at, _key, event in ordered:
         pending = _Pending(event=event, at=at if at is not None else anchor)
         all_pending.append(pending)
 
@@ -338,6 +439,10 @@ def simulate_strategy(state, events, opts=None):
 
     payment_in_force = (_d(state.contract_payment) if state.contract_payment
                         else _annuity(balance, n))
+    # Аннуитет, фактически уплаченный в текущем периоде: от него отсчитывается
+    # доплата события с `amount_kind='budget'`. До первого планового платежа
+    # равен платежу «в силе».
+    annuity_paid = payment_in_force
 
     def _emit(date, row_kind, payment, principal, interest, early, early_interest, bal_after):
         """Строка графика. Порядок ключей — ROW_KEYS, менять нельзя."""
@@ -370,12 +475,13 @@ def simulate_strategy(state, events, opts=None):
     # ── События до первого предстоящего платежа: накопленного периода ещё нет,
     #    поэтому days = 0 и режимы распределения тождественны ────────────────
     for pending in pre:
-        amount = _d(pending.event.amount or 0)
+        amount = _resolve_amount(pending.event, annuity_paid)
         pending.applied = True
         if amount <= _ZERO:
             continue
         applied = min(amount, balance)
-        lump_unused += amount - applied
+        if pending.event.kind == KIND_LUMP:
+            lump_unused += amount - applied
         balance -= applied
         _emit(pending.at, ROW_EARLY, applied, applied, _ZERO, applied, _ZERO, balance)
         _apply_mode(pending.event)
@@ -391,7 +497,7 @@ def simulate_strategy(state, events, opts=None):
             event = pending.event
             at = pending.at
             allocation = event.allocation or opts.allocation
-            amount = _d(event.amount or 0)
+            amount = _resolve_amount(event, annuity_paid)
             pending.applied = True
             if amount <= _ZERO:
                 continue
@@ -411,7 +517,8 @@ def simulate_strategy(state, events, opts=None):
                 # Досрочка меньше начисленных процентов: тело не уменьшаем,
                 # непокрытый остаток предъявляем ближайшим аннуитетом.
                 carried_interest += accrued - paid_interest
-                lump_unused += amount - cash
+                if event.kind == KIND_LUMP:
+                    lump_unused += amount - cash
                 segments = []
                 _emit(at, ROW_EARLY, cash, paid_principal, paid_interest,
                       paid_principal, paid_interest, balance)
@@ -420,7 +527,8 @@ def simulate_strategy(state, events, opts=None):
                 # предъявлены ближайшим аннуитетом — инвариант 3ca4b3e.
                 segments.append((cursor, at, balance))
                 applied = min(amount, balance)
-                lump_unused += amount - applied
+                if event.kind == KIND_LUMP:
+                    lump_unused += amount - applied
                 balance -= applied
                 _emit(at, ROW_EARLY, applied, applied, _ZERO, applied, _ZERO, balance)
 
@@ -464,6 +572,7 @@ def simulate_strategy(state, events, opts=None):
         total_interest += interest
         annuity_months += 1
         remaining_term = max(remaining_term - 1, 0)
+        annuity_paid = payment          # от него отсчитывается доплата из бюджета
         _emit(pay_date, ROW_ANNUITY, payment, principal, interest, _ZERO, _ZERO, balance)
         anchor = pay_date
 
@@ -474,12 +583,13 @@ def simulate_strategy(state, events, opts=None):
         #     Проценты периода уже закрыты аннуитетом, поэтому здесь
         #     interest_first тождествен principal_only.
         for pending in on_date[i]:
-            amount = _d(pending.event.amount or 0)
+            amount = _resolve_amount(pending.event, annuity_paid)
             pending.applied = True
             if amount <= _ZERO:
                 continue
             applied = min(amount, balance)
-            lump_unused += amount - applied
+            if pending.event.kind == KIND_LUMP:
+                lump_unused += amount - applied
             balance -= applied
             _emit(pay_date, ROW_EARLY, applied, applied, _ZERO, applied, _ZERO, balance)
             _apply_mode(pending.event)
@@ -489,10 +599,13 @@ def simulate_strategy(state, events, opts=None):
     # ── Дренаж: события, до которых цикл не дошёл ───────────────────────────
     #    Молча терять их нельзя — сценарий с несостоявшимся событием обязан
     #    быть видимым, иначе «ничего не сделал» выигрывает у реального погашения.
+    #    Ежемесячные доплаты в дренаж НЕ идут: их «неприменение» означает, что
+    #    кредит закрылся раньше конца графика, и записывать неистраченный бюджет
+    #    в `lump_unused` («не понадобилось +X ₽» разовой суммы) было бы враньём.
     for pending in all_pending:
-        if pending.applied:
+        if pending.applied or pending.event.kind == KIND_RECURRING:
             continue
-        amount = _d(pending.event.amount or 0)
+        amount = _resolve_amount(pending.event, payment_in_force)
         if amount > _ZERO:
             lump_unused += amount
             status = STATUS_NOT_APPLICABLE

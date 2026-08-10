@@ -4,10 +4,10 @@ Core financial calculation logic.
 All mortgage calculations use the annuity (равные платежи) method.
 Deposit calculations support both compound (капитализация) and simple interest.
 
-`build_amortization()` и `simulate_lump_repayment()` — тонкие обёртки над
-событийным движком `app/engine.py`: сам помесячный цикл, начисление процентов
-сегментами и правило распределения досрочки живут там. `calc_repayment_schedule()`
-(снежный ком) остаётся отдельной реализацией до Итерации 3.
+`build_amortization()`, `simulate_lump_repayment()` и `calc_repayment_schedule()` —
+тонкие обёртки над событийным движком `app/engine.py`: сам помесячный цикл,
+начисление процентов сегментами и правило распределения досрочки живут там.
+Второго движка в этом файле больше нет (Итерация 3).
 """
 from decimal import Decimal
 from dateutil.rrule import rrule, MONTHLY
@@ -15,12 +15,18 @@ from dateutil.relativedelta import relativedelta
 
 from .engine import (
     ALLOC_PRINCIPAL_ONLY,
+    AMOUNT_BUDGET,
+    KIND_LUMP,
+    KIND_RECURRING,
+    MODE_PAYMENT,
     ROW_ANNUITY,
     ROW_EARLY,
+    STATUS_OK,
     MortgageState,
     RepaymentEvent,
     SimOptions,
     basis_for,
+    payment_grid,
     simulate_strategy,
     _d,
     _next_business_day,
@@ -266,245 +272,272 @@ def simulate_lump_repayment(loan_amount, annual_rate, first_payment_date, last_p
 # Snowball + one-time repayment simulation
 # ---------------------------------------------------------------------------
 
-def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_payment_date,
-                             lump_sum, lump_idx,
-                             monthly_budget, monthly_idx,
-                             monthly_extra_day=None):
+def simulate_snowball(loan_amount, annual_rate, first_payment_date, last_payment_date,
+                      lump_sum, lump_idx, monthly_budget, monthly_idx,
+                      monthly_extra_day=None, mode=MODE_PAYMENT, contract_payment=None,
+                      adjust_business_days=False, allocation=None):
     """
-    Unified repayment simulation supporting both lump-sum and snowball.
+    Снежный ком целиком: ежемесячная доплата из бюджета плюс, если есть, разовая
+    досрочка. Возвращает `StrategyResult` движка — со `schedule`, `lump_unused`,
+    `annuity_months` и `status`.
 
-    When monthly_extra_day is set (must be > annuity day):
-      - Annuity date: pay interest (accrued over FULL period from prev payment,
-        split across pre/post early repayment if applicable) + principal.
-      - Extra date (payday): pay principal ONLY — no interest. Early repayment
-        reduces the balance immediately; the interest saving shows up as lower
-        interest in the NEXT month's annuity (daily accrual on reduced balance).
+    `calc_repayment_schedule()` — трёхэлементная обёртка над этой функцией;
+    `run_comparison()` берёт полный результат отсюда, иначе `lump_unused` пришлось
+    бы молча выбрасывать (Итерация 3, пункт 3c).
+
+    Стратегия выражается двумя событиями движка:
+
+    * `recurring` с `amount_kind='budget'` — «всего готов платить в месяц»:
+      доплата резолвится в момент применения как `бюджет − уплаченный в этом
+      периоде аннуитет`, поэтому в `reduce_payment` она растёт вслед за падающим
+      аннуитетом, в `reduce_term` остаётся постоянной, а месячный расход
+      заёмщика в любом режиме равен бюджету ровно;
+    * `lump` в дату платежа №`lump_idx` — применяется ПОСЛЕ аннуитета той даты,
+      поэтому проценты того месяца равны baseline-процентам (инвариант 3ca4b3e).
+
+    Что изменилось против прежней собственной реализации (Итерация 3):
+
+    * `contract_payment` — введённый платёж вместо пересчёта аннуитета каждый
+      месяц (3a-1);
+    * `adjust_business_days` — снежок наконец знает про перенос на рабочий день,
+      и график считается по той же сетке дат, что и все прочие сценарии (3a-2);
+    * `monthly_extra_day` больше НЕ переключает базу начисления: база приходит
+      только из `adjust_business_days` (3a-3, решение 4 роадмапа);
+    * аннуитет платится полностью, бюджет идёт сверху — снято `min(annuity,
+      budget)`, из-за которого при бюджете меньше платежа тело не гасилось вовсе
+      (3b);
+    * `months_to_payoff` считает плановые месяцы, а не строки графика (3b).
+    """
+    first_dt = _parse_date(first_payment_date)
+    last_dt = _parse_date(last_payment_date)
+    next_dt = first_dt + relativedelta(months=1)
+
+    state = MortgageState(
+        loan_amount=loan_amount,
+        annual_rate=annual_rate,
+        first_payment_date=next_dt,
+        last_payment_date=last_dt,
+        prev_payment_date=first_dt,
+        contract_payment=contract_payment,
+    )
+    opts = SimOptions(
+        basis=basis_for(adjust_business_days),
+        allocation=allocation or ALLOC_PRINCIPAL_ONLY,
+    )
+    dates, _anchor = payment_grid(state, opts.basis)
+
+    events = []
+    if dates:
+        budget = float(monthly_budget or 0)
+        start_idx = int(monthly_idx or 0)
+        if budget > 0 and 0 <= start_idx < len(dates):
+            # Событие бюджета идёт ПЕРВЫМ: при совпадении дат оно применяется до
+            # разовой досрочки, как в прежнем снежке, и пересчёт платежа от
+            # досрочки достаётся уже следующему периоду.
+            events.append(RepaymentEvent(
+                amount=budget,
+                kind=KIND_RECURRING,
+                amount_kind=AMOUNT_BUDGET,
+                mode=mode,
+                start_date=dates[start_idx],
+                day_of_month=int(monthly_extra_day) if monthly_extra_day else None,
+            ))
+
+        lump = float(lump_sum or 0)
+        if lump > 0:
+            idx = int(lump_idx or 0)
+            # Индекс за концом графика: событие не состоится, движок покажет это
+            # через `lump_unused` и `status='not_applicable'`, а не молча съест.
+            at = dates[idx] if 0 <= idx < len(dates) else dates[-1] + relativedelta(months=1)
+            events.append(RepaymentEvent(amount=lump, at=at, kind=KIND_LUMP, mode=mode))
+
+    return simulate_strategy(state, events, opts)
+
+
+def calc_repayment_schedule(loan_amount, annual_rate, first_payment_date, last_payment_date,
+                            lump_sum, lump_idx,
+                            monthly_budget, monthly_idx,
+                            monthly_extra_day=None, mode=MODE_PAYMENT,
+                            contract_payment=None, adjust_business_days=False,
+                            allocation=None):
+    """
+    Снежный ком: ежемесячная доплата из бюджета плюс разовая досрочка.
+
+    `monthly_budget` — ВЕСЬ месячный платёж («всего готов платить в месяц»), а не
+    доплата сверх аннуитета. Аннуитет из него платится полностью, остаток уходит
+    в тело; если бюджет меньше аннуитета, доплаты просто нет.
+
+    `monthly_extra_day` — день доплаты. Если он позже дня платежа, доплата уходит
+    отдельной строкой и период начисления делится по дням; иначе платится в дату
+    аннуитета, сразу после него. На БАЗУ начисления процентов не влияет никак.
+
+    Необязательные `mode` / `contract_payment` / `adjust_business_days` /
+    `allocation` добавлены на Итерации 3; дефолты сохраняют прежний внешний
+    контракт вызова.
 
     Returns: (total_interest, months_to_payoff, schedule)
     """
-    import calendar as _cal
+    result = simulate_snowball(
+        loan_amount, annual_rate, first_payment_date, last_payment_date,
+        lump_sum, lump_idx, monthly_budget, monthly_idx,
+        monthly_extra_day=monthly_extra_day, mode=mode,
+        contract_payment=contract_payment,
+        adjust_business_days=adjust_business_days, allocation=allocation,
+    )
+    return result.total_interest, result.months_to_payoff, result.schedule
 
-    if isinstance(first_payment_date, str):
-        first_payment_date = _parse_date(first_payment_date)
-    if isinstance(last_payment_date, str):
-        last_payment_date = _parse_date(last_payment_date)
 
-    next_dt = first_payment_date + relativedelta(months=1)
-    scheduled_dates = list(rrule(MONTHLY, dtstart=next_dt, until=last_payment_date))
-    original_n = len(scheduled_dates)
+# ---------------------------------------------------------------------------
+# Честность денежных потоков (решение 7 роадмапа)
+# ---------------------------------------------------------------------------
 
-    monthly_rate_d = _d(annual_rate) / _d(100) / _d(12)
-    daily_rate_d   = _d(annual_rate) / _d(100) / _d(365)
-    lump_d = _d(lump_sum or 0)
-    budget_d = _d(monthly_budget or 0)
+def _month_key(stamp):
+    """'DD.MM.YYYY' → 'MM.YYYY'."""
+    return stamp[3:]
 
-    balance = _d(loan_amount)
-    total_interest = Decimal('0')
-    schedule = []
-    lump_applied = False
 
-    # State carried across iterations for split-day interest calculation:
-    #   prev_annuity_date  — date of the last annuity row
-    #   split_info         — (early_date, balance_before_early) when the previous
-    #                        month had a separate early-repayment row; None otherwise
-    prev_annuity_date = first_payment_date
-    split_info = None  # type: tuple | None
+def _month_order(key):
+    """Ключ сортировки месяцев: 'MM.YYYY' → (год, месяц)."""
+    month, year = key.split('.')
+    return int(year), int(month)
 
-    for i, date in enumerate(scheduled_dates):
-        if balance <= Decimal('0.01'):
+
+def cash_by_month(schedule, extra=None):
+    """
+    'MM.YYYY' → сколько рублей заёмщик отдал в этом месяце.
+
+    Считаются ВСЕ строки графика (плановые и досрочные), поэтому месяц с
+    досрочкой честно выходит дороже. `extra` — движение денег мимо ипотеки:
+    взнос на вклад со знаком «+», снятие со вклада со знаком «−». Снятые со
+    вклада деньги не являются новым оттоком: без вычитания арм «сначала вклад»
+    выглядел бы так, будто заплатил ту же сумму дважды.
+    """
+    out = {}
+    for row in schedule:
+        key = _month_key(row['date'])
+        out[key] = round(out.get(key, 0.0) + row['payment'], 2)
+    for key, amount in (extra or {}).items():
+        out[key] = round(out.get(key, 0.0) + amount, 2)
+    return out
+
+
+def cash_parity_report(base_cash, arm_cash, exclude_months=()):
+    """
+    Месяцы, в которых арм и база тратят разные деньги.
+
+    Исключаются месяц внешнего вливания (`exclude_months`) и хвост: с месяца, в
+    котором закрывается более короткий из двух графиков, сравнивать уже нечего.
+
+    Пустой отчёт == сравнение честное. Для `reduce_payment` без реинвеста
+    высвобожденного платежа отчёт непуст в КАЖДОМ месяце после досрочки — это и
+    есть машинная проверка того, что реинвест не забыт (решение 7).
+    """
+    if not base_cash or not arm_cash:
+        return []
+    exclude = set(exclude_months or ())
+    tail = min(max(base_cash, key=_month_order), max(arm_cash, key=_month_order),
+               key=_month_order)
+    report = []
+    for key in sorted(set(base_cash) | set(arm_cash), key=_month_order):
+        if _month_order(key) >= _month_order(tail):
             break
-
-        remaining_n = original_n - i
-
-        # ── Interest for this annuity ──────────────────────────────────────
-        if split_info is not None:
-            # Previous month had an early repayment on split_info[0].
-            # balance here = balance AFTER that early repayment.
-            # Accrue daily interest: period-1 (prev_annuity → early) on the
-            # pre-early balance; period-2 (early → today) on the post-early balance.
-            early_date_prev, bal_before_early = split_info
-            days1 = (early_date_prev - prev_annuity_date).days
-            days2 = (date - early_date_prev).days
-            interest = _r2(
-                bal_before_early * daily_rate_d * _d(days1) +
-                balance           * daily_rate_d * _d(days2)
-            )
-            split_info = None
-        elif monthly_extra_day:
-            # No prior early, but daily-rate mode is active for consistency.
-            days = (date - prev_annuity_date).days
-            interest = _r2(balance * daily_rate_d * _d(days))
-        else:
-            interest = _r2(balance * monthly_rate_d)
-
-        # ── Regular annuity (recalculated from current balance) ────────────
-        if remaining_n == 1:
-            annuity = _r2(balance + interest)
-        else:
-            factor = (1 + monthly_rate_d) ** remaining_n
-            annuity = _r2(balance * monthly_rate_d * factor / (factor - 1))
-
-        snowball_active = bool(monthly_budget) and i >= monthly_idx
-        lump_this_month = not lump_applied and lump_d > Decimal('0') and i == lump_idx
-
-        # ── Decide whether to split onto different dates ───────────────────
-        use_split = False
-        extra_date = None
-        if snowball_active and monthly_extra_day:
-            extra_day_int = int(monthly_extra_day)
-            last_day = _cal.monthrange(date.year, date.month)[1]
-            clamped = min(extra_day_int, last_day)
-            candidate = date.replace(day=clamped)
-            if candidate.day > date.day:
-                use_split = True
-                extra_date = candidate
-
-        if use_split:
-            # ── Row 1: annuity on scheduled date ──────────────────────────
-            regular_base = min(annuity, budget_d)
-            principal_reg = _r2(regular_base - interest)
-            if principal_reg < Decimal('0'):
-                principal_reg = Decimal('0')
-                regular_base = interest
-
-            early_row1 = Decimal('0')
-            if lump_this_month:
-                lump_cap = min(lump_d, balance - principal_reg)
-                lump_cap = max(lump_cap, Decimal('0'))
-                principal_reg += lump_cap
-                regular_base  += lump_cap
-                early_row1 = lump_cap
-                lump_applied = True
-
-            balance -= principal_reg
-            balance  = max(balance, Decimal('0'))
-            total_interest += interest
-            prev_annuity_date = date
-
-            schedule.append({
-                'payment_num': len(schedule) + 1,
-                'date':        date.strftime('%d.%m.%Y'),
-                'payment':     float(regular_base),
-                'principal':   float(principal_reg),
-                'interest':    float(interest),
-                'balance':     float(_r2(balance)),
-                'early':       float(early_row1),
-                'row_kind':    ROW_ANNUITY,
-                'early_interest': 0.0,
+        if key in exclude:
+            continue
+        base_amount = base_cash.get(key, 0.0)
+        arm_amount = arm_cash.get(key, 0.0)
+        diff = round(arm_amount - base_amount, 2)
+        if abs(diff) > 0.01:
+            report.append({
+                'month': key,
+                'baseline': base_amount,
+                'scenario': arm_amount,
+                'diff': diff,
             })
+    return report
 
-            if balance <= Decimal('0.01'):
-                break
 
-            # ── Row 2: early repayment — principal ONLY, no interest ───────
-            # Interest for this gap period will be collected at the NEXT annuity.
-            regular_base_nolump = min(annuity, budget_d)
-            extra_amount = _r2(budget_d - regular_base_nolump)
-            extra_amount = max(extra_amount, Decimal('0'))
-            extra_amount = min(extra_amount, balance)
+def _freed_by_month(schedule, contract_payment):
+    """
+    'MM.YYYY' → высвобожденная часть платежа: сколько заёмщик НЕ отдал банку
+    против договорного платежа. Считается по ВСЕМ строкам месяца, поэтому месяц
+    досрочки высвобожденных денег не даёт.
+    """
+    spent = {}
+    for row in schedule:
+        key = _month_key(row['date'])
+        spent[key] = round(spent.get(key, 0.0) + row['payment'], 2)
+    freed = {}
+    for key, amount in spent.items():
+        rest = round(float(contract_payment) - amount, 2)
+        if rest > 0:
+            freed[key] = rest
+    return freed
 
-            if extra_amount > Decimal('0.01'):
-                bal_before_early = balance          # balance after annuity, before extra
-                balance -= extra_amount
-                balance  = max(balance, Decimal('0'))
-                # No interest added here — accrues until next annuity date.
 
-                schedule.append({
-                    'payment_num': len(schedule) + 1,
-                    'date':        extra_date.strftime('%d.%m.%Y'),
-                    'payment':     float(extra_amount),   # principal only
-                    'principal':   float(extra_amount),
-                    'interest':    0.0,
-                    'balance':     float(_r2(balance)),
-                    'early':       float(extra_amount),
-                    'row_kind':    ROW_EARLY,
-                    'early_interest': 0.0,
-                })
-                # Carry forward for next month's split interest calculation.
-                split_info = (extra_date, bal_before_early)
+def calc_reinvest_income(contributions, annual_rate, capitalization):
+    """
+    Доход по потоку высвобожденных платежей (решения 7 и 16 роадмапа).
 
-            if balance <= Decimal('0.01'):
-                break
+    `contributions` — взносы по месяцам жизни арма в хронологическом порядке.
+    Горизонт — закрытие СВОЕГО арма: последний взнос дохода уже не приносит.
+    Соглашение о начислении то же, что в `calc_monthly_deposit`.
+    """
+    months = len(contributions)
+    if not months or not annual_rate:
+        return 0.0
+    monthly_rate = float(annual_rate) / 100 / 12
+    if capitalization:
+        balance = 0.0
+        for amount in contributions:
+            balance = balance * (1 + monthly_rate) + amount
+        income = balance - sum(contributions)
+    else:
+        income = 0.0
+        for k, amount in enumerate(contributions, start=1):
+            income += amount * monthly_rate * (months - k)
+    return round(income, 2)
 
-        else:
-            # ── Row 1: annuity (interest + regular principal, no early) ────
-            principal_reg = _r2(annuity - interest)
-            if principal_reg < Decimal('0'):
-                principal_reg = Decimal('0')
 
-            # Nearly paid off — sweep everything into one final row
-            pay_off_all = snowball_active and (balance + interest) <= budget_d
-            if pay_off_all:
-                early_final = max(_r2(balance - principal_reg), Decimal('0'))
-                balance = Decimal('0')
-                total_interest += interest
-                prev_annuity_date = date
-                schedule.append({
-                    'payment_num': len(schedule) + 1,
-                    'date':        date.strftime('%d.%m.%Y'),
-                    'payment':     float(_r2(interest + principal_reg + early_final)),
-                    'principal':   float(_r2(principal_reg + early_final)),
-                    'interest':    float(interest),
-                    'balance':     0.0,
-                    'early':       float(early_final),
-                    'row_kind':    ROW_ANNUITY,
-                    'early_interest': 0.0,
-                })
-                if lump_this_month:
-                    lump_applied = True
-                break
+def _reinvest_of(schedule, contract_payment, annual_rate, capitalization):
+    """
+    Доход по высвобожденному платежу арма и сами взносы по месяцам.
 
-            # Normal annuity row — early = 0
-            balance -= principal_reg
-            balance  = max(balance, Decimal('0'))
-            total_interest += interest
-            prev_annuity_date = date
-            schedule.append({
-                'payment_num': len(schedule) + 1,
-                'date':        date.strftime('%d.%m.%Y'),
-                'payment':     float(annuity),
-                'principal':   float(principal_reg),
-                'interest':    float(interest),
-                'balance':     float(_r2(balance)),
-                'early':       0.0,
-                'row_kind':    ROW_ANNUITY,
-                'early_interest': 0.0,
-            })
+    Применяется только к семье `plain`: там обязательство заёмщика равно
+    договорному платежу, и всё, что арм не отдал банку, уходит на вклад под ту
+    же ставку. В снежном коме обязательство — месячный бюджет, и высвобожденные
+    деньги тратятся на ипотеку в том же месяце.
+    """
+    freed = _freed_by_month(schedule, contract_payment)
+    if not freed or not annual_rate:
+        return 0.0, freed
+    months = []
+    for row in schedule:
+        key = _month_key(row['date'])
+        if key not in months:
+            months.append(key)
+    contributions = [freed.get(key, 0.0) for key in months]
+    return calc_reinvest_income(contributions, annual_rate, capitalization), freed
 
-            if balance <= Decimal('0.01'):
-                break
 
-            # ── Row 2: early repayment — principal ONLY, no interest ───────
-            extra = Decimal('0')
-            if snowball_active:
-                extra = _r2(max(budget_d - annuity, Decimal('0')))
-                extra = min(extra, balance)
+def _withdrawals_of(schedule):
+    """
+    'MM.YYYY' → сколько денег со вклада ушло в ипотеку (со знаком «−»).
 
-            if lump_this_month:
-                extra_lump = min(lump_d, balance - extra)
-                extra_lump = max(extra_lump, Decimal('0'))
-                extra += extra_lump
-                lump_applied = True
+    Нужно армy «сначала вклад»: сумма закрытого вклада — не новый отток,
+    заёмщик отдаёт банку те же деньги, что положил на вклад месяцем раньше.
+    """
+    out = {}
+    for row in schedule:
+        if row['row_kind'] != ROW_EARLY:
+            continue
+        key = _month_key(row['date'])
+        out[key] = round(out.get(key, 0.0) - row['payment'], 2)
+    return out
 
-            if extra > Decimal('0.01'):
-                balance -= extra
-                balance  = max(balance, Decimal('0'))
-                schedule.append({
-                    'payment_num': len(schedule) + 1,
-                    'date':        date.strftime('%d.%m.%Y'),
-                    'payment':     float(extra),
-                    'principal':   float(extra),
-                    'interest':    0.0,
-                    'balance':     float(_r2(balance)),
-                    'early':       float(extra),
-                    'row_kind':    ROW_EARLY,
-                    'early_interest': 0.0,
-                })
 
-            if balance <= Decimal('0.01'):
-                break
-
-    return float(_r2(total_interest)), len(schedule), schedule
+def _early_months(schedule):
+    """Месяцы, в которых арм внёс досрочку (месяцы внешнего вливания)."""
+    return {_month_key(row['date']) for row in schedule if row['row_kind'] == ROW_EARLY}
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +554,28 @@ def run_comparison(mortgage, deposit, strategy=None):
     strategy fields used:
         lump_sum, lump_sum_date, monthly_budget, monthly_start_date,
         repayment_mode, early_repayment_allocation
+
+    Метрика сравнения (решение 5 роадмапа):
+
+        own_cost = total_interest − deposit_income − reinvest_income
+        interest_saved = own_cost базы − own_cost сценария
+        winner = argmin(own_cost) ≡ argmax(interest_saved)
+
+    `lump_unused` в метрику НЕ входит: излишек уже сидит внутри `deposit_income`
+    (F = S + income), вычесть его второй раз значило бы завысить выгоду.
+
+    Честность денежных потоков (решение 7). Все армы обязаны тратить одинаковые
+    рубли в каждом месяце, иначе сравнение недействительно:
+
+    * на вкладе лежит ТОЛЬКО разовая сумма — профицит бюджета туда не кладётся;
+    * в `reduce_payment` высвобожденная часть платежа реинвестируется под ту же
+      ставку до закрытия своего арма (решение 16);
+    * непустой `monthly_budget` переводит сравнение в семью `snowball`
+      (`baseline_kind` в ответе): в семье `plain` бюджет не тратит ни один
+      сценарий, и оставить его там значило бы молча выбросить деньги.
+
+    Проверка — `cash_parity_report()`: в ответе поле `cash_parity`, пустое, если
+    сравнение честное.
     """
     strategy = strategy or {}
     adj = bool(mortgage.get('adjust_business_days'))
@@ -563,49 +618,107 @@ def run_comparison(mortgage, deposit, strategy=None):
     payment_dates = baseline.dates
     original_n = len(payment_dates)
 
-    # Снежок (`calc_repayment_schedule`) до Итерации 3 строит свою сетку сам и
-    # `adjust_business_days` не знает, поэтому его индексы считаются по сырым
-    # датам — иначе индекс из сдвинутой сетки указывал бы не на ту строку.
-    snowball_dates = list(rrule(MONTHLY, dtstart=next_dt, until=last_dt))
-    lump_idx = _date_to_idx(lump_sum_date, snowball_dates)
-    monthly_idx = _date_to_idx(monthly_start_date, snowball_dates)
+    # Индексы снежка считаются по ТОЙ ЖЕ сетке: с Итерации 3 снежок знает про
+    # перенос на рабочий день, и сырой rrule больше не нужен — иначе индекс из
+    # одной сетки указывал бы на дату из другой.
+    lump_idx = _date_to_idx(lump_sum_date, payment_dates)
+    monthly_idx = _date_to_idx(monthly_start_date, payment_dates)
 
-    def _lump_run(amount, at_date, mode):
-        """One lump-sum repayment on the current mortgage."""
-        return simulate_lump_repayment(
-            mortgage['loan_amount'], mortgage['annual_rate'], next_dt, last_dt,
-            mortgage['monthly_payment'], amount, at_date, mode=mode,
-            adjust_business_days=adj, prev_payment_date=first_dt,
-            allocation=allocation,
+    # Семья сравнения (решение 7): непустой месячный бюджет автоматически
+    # переводит расчёт в «снежный ком». Переключение обязано быть видимым,
+    # поэтому причина уезжает в ответ и печатается в карточке параметров.
+    baseline_kind = 'snowball' if monthly_budget else 'plain'
+    baseline_kind_reason = (
+        'задан месячный бюджет: в семье «чистая ипотека» его не тратит ни один сценарий'
+        if monthly_budget else None
+    )
+
+    deposit_rate = float(deposit['annual_rate']) if deposit else 0.0
+    deposit_cap = bool(deposit['capitalization']) if deposit else True
+
+    def _lump_result(amount, at_date, mode):
+        """Полный результат движка по одной разовой досрочке."""
+        state = MortgageState(
+            loan_amount=mortgage['loan_amount'],
+            annual_rate=mortgage['annual_rate'],
+            first_payment_date=next_dt,
+            last_payment_date=last_dt,
+            prev_payment_date=first_dt,
+            contract_payment=mortgage['monthly_payment'],
         )
+        events = []
+        if float(amount or 0) > 0:
+            events.append(RepaymentEvent(amount=amount, at=at_date, kind=KIND_LUMP, mode=mode))
+        return simulate_strategy(state, events, opts)
+
+    def _reinvest(result):
+        """Доход по высвобожденному платежу арма (решения 7 и 16)."""
+        return _reinvest_of(result.schedule, mortgage['monthly_payment'],
+                            deposit_rate, deposit_cap)
 
     # --- Strategy A: keep lump_sum on deposit for T months, then repay ---
     deposit_income = 0.0
     deposit_final = 0.0
     deposit_net_saving = 0.0
     deposit_new_monthly = 0.0
+    deposit_reinvest_income = 0.0
+    deposit_lump_unused = 0.0
+    deposit_total_interest = baseline_total_interest
+    deposit_status = STATUS_OK
     balance_after_deposit = mortgage['loan_amount']
     deposit_schedule = list(base_schedule)
+    deposit_cash_extra = {}
+    deposit_exclude_months = set()
+    maturity_idx = None
 
     if lump_sum > 0 and deposit:
-        term_months = min(deposit['term_months'], original_n)
-        monthly_surplus = max((monthly_budget or 0) - mortgage['monthly_payment'], 0)
+        term_months = min(int(deposit['term_months']), original_n)
+        # ОДИН индекс закрытия вклада на всё сравнение: и здесь, и в снежке.
+        # Раньше снежок брал min(term, n − 1) и гасил месяцем позже, чем арм A.
+        maturity_idx = max(term_months - 1, 0)
 
-        deposit_income, deposit_final = calc_monthly_deposit(
-            lump_sum, monthly_surplus,
-            deposit['annual_rate'], deposit['capitalization'],
-            term_months,
+        # На вкладе лежит ТОЛЬКО разовая сумма (решение 7): профицит бюджета
+        # никакой арм на вклад не кладёт, иначе арм вклада каждый месяц получает
+        # чужие деньги и сравнение недействительно.
+        deposit_income, deposit_final = calc_deposit(
+            lump_sum, deposit['annual_rate'], term_months, deposit['capitalization'],
         )
 
-        balance_after_deposit = base_schedule[term_months - 1]['balance'] if term_months > 0 else mortgage['loan_amount']
+        balance_after_deposit = (base_schedule[maturity_idx]['balance']
+                                 if term_months > 0 else mortgage['loan_amount'])
 
         # Money becomes available right after the payment that closes the deposit term.
         # Дата берётся из сетки движка, а не из сырого rrule.
-        deposit_lump_date = payment_dates[term_months - 1] if term_months > 0 else None
-        deposit_schedule, deposit_new_monthly, interest_A, _ = _lump_run(
-            deposit_final, deposit_lump_date, repayment_mode,
-        )
-        deposit_net_saving = round(baseline_total_interest - interest_A, 2)
+        deposit_lump_date = payment_dates[maturity_idx] if term_months > 0 else None
+        result_a = _lump_result(deposit_final, deposit_lump_date, repayment_mode)
+        deposit_schedule = result_a.schedule
+        deposit_new_monthly = result_a.monthly_payment
+        deposit_total_interest = result_a.total_interest
+        deposit_lump_unused = result_a.lump_unused
+        deposit_status = result_a.status
+        deposit_reinvest_income, deposit_freed = _reinvest(result_a)
+
+        # Кэш арма: взнос на вклад «сейчас» — внешнее вливание (месяц исключается
+        # из паритета), снятие со вклада в дату погашения — не новый отток,
+        # реинвест высвобожденного платежа — отток наравне с платежом банку.
+        open_month = _month_key(payment_dates[0].strftime('%d.%m.%Y'))
+        deposit_cash_extra = dict(_withdrawals_of(deposit_schedule))
+        deposit_cash_extra[open_month] = round(
+            deposit_cash_extra.get(open_month, 0.0) + lump_sum, 2)
+        for month, amount in deposit_freed.items():
+            deposit_cash_extra[month] = round(deposit_cash_extra.get(month, 0.0) + amount, 2)
+        deposit_exclude_months = {open_month}
+
+        # Роадмап (3c) записывает эту строку как
+        #   baseline − interest_A + deposit_income,
+        # то есть без реинвеста: пункт про реинвест в том же списке идёт ниже.
+        # Решение 5 требует единой метрики `interest_saved = own_cost базы −
+        # own_cost сценария`, а она равна формуле роадмапа ПЛЮС доход по
+        # высвобожденному платежу. В `reduce_term` высвобожденного платежа нет,
+        # и обе формулы совпадают ровно.
+        deposit_net_saving = round(
+            baseline_total_interest - deposit_total_interest
+            + deposit_income + deposit_reinvest_income, 2)
 
     # --- Strategy B1: lump_sum → reduce payment (lower annuity, same term) ---
     # --- Strategy B2: lump_sum → reduce term  (same payment, shorter term) ---
@@ -616,19 +729,40 @@ def run_comparison(mortgage, deposit, strategy=None):
     reduce_term_months_saved = 0
     reduce_payment_schedule = list(base_schedule)
     reduce_term_schedule = list(base_schedule)
+    reduce_payment_total_interest = baseline_total_interest
+    reduce_term_total_interest = baseline_total_interest
+    reduce_payment_reinvest_income = 0.0
+    reduce_term_reinvest_income = 0.0
+    reduce_payment_lump_unused = 0.0
+    reduce_term_lump_unused = 0.0
+    reduce_payment_status = STATUS_OK
+    reduce_term_status = STATUS_OK
+    reduce_payment_cash_extra = {}
+    reduce_term_cash_extra = {}
 
     if lump_sum > 0:
-        reduce_payment_schedule, new_monthly_b, interest_b1, _ = _lump_run(
-            lump_sum, lump_sum_date, 'reduce_payment',
-        )
-        reduce_payment_interest_saved = round(baseline_total_interest - interest_b1, 2)
+        result_b1 = _lump_result(lump_sum, lump_sum_date, 'reduce_payment')
+        reduce_payment_schedule = result_b1.schedule
+        new_monthly_b = result_b1.monthly_payment
+        reduce_payment_total_interest = result_b1.total_interest
+        reduce_payment_lump_unused = result_b1.lump_unused
+        reduce_payment_status = result_b1.status
+        reduce_payment_reinvest_income, reduce_payment_cash_extra = _reinvest(result_b1)
+        reduce_payment_interest_saved = round(
+            baseline_total_interest - reduce_payment_total_interest
+            + reduce_payment_reinvest_income, 2)
 
-        reduce_term_schedule, _, interest_b2, months_b2 = _lump_run(
-            lump_sum, lump_sum_date, 'reduce_term',
-        )
-        reduce_term_interest_saved = round(baseline_total_interest - interest_b2, 2)
-        reduce_term_months_to_payoff = months_b2
-        reduce_term_months_saved = original_n - months_b2
+        result_b2 = _lump_result(lump_sum, lump_sum_date, 'reduce_term')
+        reduce_term_schedule = result_b2.schedule
+        reduce_term_total_interest = result_b2.total_interest
+        reduce_term_lump_unused = result_b2.lump_unused
+        reduce_term_status = result_b2.status
+        reduce_term_reinvest_income, reduce_term_cash_extra = _reinvest(result_b2)
+        reduce_term_interest_saved = round(
+            baseline_total_interest - reduce_term_total_interest
+            + reduce_term_reinvest_income, 2)
+        reduce_term_months_to_payoff = result_b2.months_to_payoff
+        reduce_term_months_saved = original_n - result_b2.months_to_payoff
 
     # --- Strategy C: snowball ---
     snowball_fields = {}
@@ -636,11 +770,11 @@ def run_comparison(mortgage, deposit, strategy=None):
     if monthly_budget:
         # When lump_sum has no explicit date but a deposit term is set, delay the lump
         # in the snowball until the deposit matures (monthly extras still run from month 1).
-        if lump_sum > 0 and not lump_sum_date and deposit:
-            snowball_lump_idx = min(deposit['term_months'], original_n - 1)
+        if lump_sum > 0 and not lump_sum_date and deposit and maturity_idx is not None:
+            snowball_lump_idx = maturity_idx
         else:
             snowball_lump_idx = lump_idx
-        snow_interest, snow_months, snow_schedule = calc_repayment_schedule(
+        snow = simulate_snowball(
             mortgage['loan_amount'],
             mortgage['annual_rate'],
             mortgage['first_payment_date'],
@@ -650,7 +784,14 @@ def run_comparison(mortgage, deposit, strategy=None):
             monthly_budget,
             monthly_idx,
             monthly_extra_day=monthly_extra_day,
+            mode=repayment_mode,
+            contract_payment=mortgage['monthly_payment'],
+            adjust_business_days=adj,
+            allocation=allocation,
         )
+        snow_interest = snow.total_interest
+        snow_months = snow.months_to_payoff
+        snow_schedule = snow.schedule
         snow_interest_saved = round(baseline_total_interest - snow_interest, 2)
 
         # Deposit alternative with same money over deposit term
@@ -682,6 +823,9 @@ def run_comparison(mortgage, deposit, strategy=None):
             'snowball_interest_saved': snow_interest_saved,
             'snowball_months_to_payoff': snow_months,
             'snowball_schedule': snow_schedule,
+            'snowball_lump_unused': snow.lump_unused,
+            'snowball_status': snow.status,
+            'snowball_own_cost': round(snow_interest, 2),
             'snowball_deposit_income': snow_dep_income,
             'snowball_deposit_final': snow_dep_final,
             'snowball_deposit_months_to_match': snow_dep_months_to_match,
@@ -700,6 +844,39 @@ def run_comparison(mortgage, deposit, strategy=None):
 
     winner = max(options, key=options.get)
 
+    # own_cost = проценты − доход по вкладу − доход по реинвесту (решение 5).
+    # `lump_unused` в метрику не входит: излишек уже внутри `deposit_income`.
+    own_cost = {
+        'baseline': round(baseline_total_interest, 2),
+        'deposit': round(deposit_total_interest - deposit_income - deposit_reinvest_income, 2),
+        'reduce_payment': round(reduce_payment_total_interest
+                                - reduce_payment_reinvest_income, 2),
+        'reduce_term': round(reduce_term_total_interest - reduce_term_reinvest_income, 2),
+    }
+    if snowball_fields:
+        own_cost['snowball'] = snowball_fields['snowball_own_cost']
+
+    # Машинная проверка честности потоков (решение 7). Непустой отчёт означает,
+    # что армы тратят разные деньги и сравнение недействительно.
+    base_cash = cash_by_month(base_schedule)
+    cash_parity = {
+        'deposit': cash_parity_report(
+            base_cash, cash_by_month(deposit_schedule, deposit_cash_extra),
+            deposit_exclude_months),
+        'reduce_payment': cash_parity_report(
+            base_cash, cash_by_month(reduce_payment_schedule, reduce_payment_cash_extra),
+            _early_months(reduce_payment_schedule)),
+        'reduce_term': cash_parity_report(
+            base_cash, cash_by_month(reduce_term_schedule, reduce_term_cash_extra),
+            _early_months(reduce_term_schedule)),
+    }
+    cash_parity_notes = {}
+    if snowball_fields:
+        cash_parity_notes['snowball'] = (
+            'сценарий тратит месячный бюджет, база «чистая ипотека» — только договорной '
+            'платёж; паритет проверяется внутри семьи «снежный ком» (И7)'
+        )
+
     return {
         'baseline_total_interest': baseline_total_interest,
         'monthly_payment': monthly_payment,
@@ -707,6 +884,9 @@ def run_comparison(mortgage, deposit, strategy=None):
         'early_repayment_allocation': allocation,
         'base_schedule': base_schedule,
         'balance_after_deposit': balance_after_deposit,
+        # База сравнения (решение 7): переключение обязано быть видимым
+        'baseline_kind': baseline_kind,
+        'baseline_kind_reason': baseline_kind_reason,
         # Full schedules (popped by the route, never stored in the DB)
         'deposit_schedule': deposit_schedule,
         'reduce_payment_schedule': reduce_payment_schedule,
@@ -717,16 +897,32 @@ def run_comparison(mortgage, deposit, strategy=None):
         'deposit_net_saving': deposit_net_saving,
         'deposit_new_monthly': deposit_new_monthly,
         'deposit_term_months': (deposit or {}).get('term_months', 0),
+        'deposit_total_interest': deposit_total_interest,
+        'deposit_reinvest_income': deposit_reinvest_income,
+        'deposit_lump_unused': deposit_lump_unused,
+        'deposit_status': deposit_status,
         # Strategy B1: reduce payment
         'reduce_payment_new_monthly': new_monthly_b,
         'reduce_payment_interest_saved': reduce_payment_interest_saved,
+        'reduce_payment_total_interest': reduce_payment_total_interest,
+        'reduce_payment_reinvest_income': reduce_payment_reinvest_income,
+        'reduce_payment_lump_unused': reduce_payment_lump_unused,
+        'reduce_payment_status': reduce_payment_status,
         # Strategy B2: reduce term
         'reduce_term_months_to_payoff': reduce_term_months_to_payoff,
         'reduce_term_months_saved': reduce_term_months_saved,
         'reduce_term_interest_saved': reduce_term_interest_saved,
+        'reduce_term_total_interest': reduce_term_total_interest,
+        'reduce_term_reinvest_income': reduce_term_reinvest_income,
+        'reduce_term_lump_unused': reduce_term_lump_unused,
+        'reduce_term_status': reduce_term_status,
         # Strategy C
         **snowball_fields,
         # Summary
         'winner': winner,
         'options': options,
+        'own_cost': own_cost,
+        'cash_parity': cash_parity,
+        'cash_parity_notes': cash_parity_notes,
+        'cash_parity_ok': not any(cash_parity.values()),
     }

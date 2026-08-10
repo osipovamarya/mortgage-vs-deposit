@@ -292,7 +292,8 @@ def compare_function(function, limit=DEFAULT_DIFF_LIMIT):
 # Реестр известных багов снежного кома
 # ---------------------------------------------------------------------------
 
-KNOWN_BUG_COMMENT = 'известный баг min(annuity, budget), чинится на И3'
+KNOWN_BUG_COMMENT = ('недоплата: график закончился, а долг не закрыт. Баг min(annuity, budget) '
+                     'исправлен на И3, реестр обязан оставаться пустым')
 
 KNOWN_BUG_CRITERION = (
     'график закончился, а остаток не закрыт: последняя строка имеет balance > 0.01 '
@@ -313,7 +314,18 @@ ROADMAP_CONTROL_KWARGS = {
     'monthly_extra_day': 15,
 }
 
+# Факт ПОСЛЕ Итерации 3: аннуитет платится полностью, бюджет идёт сверху,
+# поэтому тело гасится и при бюджете меньше платежа.
 ROADMAP_CONTROL_EXPECTED = {
+    'rows': 299,
+    'sum_principal': 8_000_000.0,
+    'final_balance': 0.0,
+    'sum_principal_with_extra_day_none': 8_000_000.0,
+}
+
+# Что этот же вход давал на И0 — ради истории: бюджет 40 000 обрезал аннуитет
+# (при процентах 106 666,67 ₽/мес), тело не гасилось ВООБЩЕ.
+ROADMAP_CONTROL_BEFORE_I3 = {
     'rows': 299,
     'sum_principal': 0.0,
     'final_balance': 8_000_000.0,
@@ -393,6 +405,7 @@ def build_known_bugs():
             'source': 'ROADMAP.md, «Итерация 0 — Golden-снимок текущего поведения»',
             'kwargs': ROADMAP_CONTROL_KWARGS,
             'roadmap_expected': ROADMAP_CONTROL_EXPECTED,
+            'measured_before_i3': ROADMAP_CONTROL_BEFORE_I3,
             'measured': control_actual,
             'matches_roadmap': control_actual == ROADMAP_CONTROL_EXPECTED,
             'measured_with_extra_day_none': control_ok,
